@@ -1,0 +1,117 @@
+name: Fork build
+
+# Fork-only manual packaging: builds one platform at a time and uploads the
+# bundles as workflow artifacts, optionally as a draft release on this fork.
+# It adds a file and changes none of upstream's workflows, so syncing with
+# `git pull --rebase upstream main` stays conflict-free.
+#
+# The signing key below is committed on purpose so no repository secret is
+# needed. Anyone with read access to this repository can sign updater
+# artifacts for builds that trust the matching public key:
+#   3DFDC5DA77EFD326  (minisign public key of this pair)
+# If the repository ever becomes public, rotate the key and move it to
+# `secrets.TAURI_SIGNING_PRIVATE_KEY`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build
+        type: choice
+        options:
+          - macos-arm64
+          - macos-x64
+          - linux-x64
+          - linux-arm64
+          - windows-x64
+          - windows-arm64
+        default: macos-arm64
+      version:
+        description: "Version override (e.g. 0.1.37-fork); empty uses tauri.conf.json"
+        type: string
+        default: ""
+      release:
+        description: Create a draft release in this fork
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  target:
+    name: Pick runner and target
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+      target: ${{ steps.pick.outputs.target }}
+    steps:
+      - id: pick
+        run: |
+          case "${{ inputs.platform }}" in
+            macos-arm64)   runner=macos-latest;     target=aarch64-apple-darwin ;;
+            macos-x64)     runner=macos-latest;     target=x86_64-apple-darwin ;;
+            linux-x64)     runner=ubuntu-22.04;     target=x86_64-unknown-linux-gnu ;;
+            linux-arm64)   runner=ubuntu-22.04-arm; target=aarch64-unknown-linux-gnu ;;
+            windows-x64)   runner=windows-latest;   target=x86_64-pc-windows-msvc ;;
+            windows-arm64) runner=windows-11-arm;   target=aarch64-pc-windows-msvc ;;
+          esac
+          echo "runner=$runner" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ inputs.platform }}
+    needs: target
+    runs-on: ${{ needs.target.outputs.runner }}
+    env:
+      TARGET: ${{ needs.target.outputs.target }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+        with: { version: 11 }
+      - uses: actions/setup-node@v5
+        with: { node-version: 22, cache: pnpm }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ env.TARGET }}" }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: "fork-${{ env.TARGET }}" }
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf
+      - run: pnpm install --frozen-lockfile
+      - name: Build bundles
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: "dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5ClJXUlRZMEl5enhhNUxlY0JIYW5wejc2MWVrU1UyUzVNNUNsUUxmck81T1VuUjM1Vyt6OEFBQkFBQUFBQUFBQUFBQUlBQUFBQTlvWS9zcGs5N3RzYTBVWUdxT3U5ZFVNQWMyTUZycFdiTU85VTdxYkZqZWFqekozWjI4NDgyTUtTUnNoWVNxVW14RXZQdHJwanFtSENhSUE2NUlKbUJWWkJWSmFLU0tJalYxU1RWcDJPS1VvcE40RkJxaWw2VzlFSjRwWXh6dG9QVVRxbC9CelJzdWM9Cg=="
+        run: |
+          # Signatures are only trusted by builds that embed the matching
+          # public key; add it with --config when wiring a fork update channel:
+          #   --config '{"plugins":{"updater":{"pubkey":"dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNERkRDNURBNzdFRkQzMjYKUldRbTArOTMyc1g5UFVzL1A4dlZndjNqbU1peVFYQVJyR3hWemtmdElqenFoL1loUGp6cVBVcGIK"}}}'
+          if [ -n "$VERSION" ]; then
+            pnpm tauri build --target "$TARGET" --config "{\"version\":\"$VERSION\"}"
+          else
+            pnpm tauri build --target "$TARGET"
+          fi
+      - uses: actions/upload-artifact@v6
+        with:
+          name: openidea-${{ inputs.platform }}
+          path: target/${{ env.TARGET }}/release/bundle/**
+          if-no-files-found: error
+      - name: Draft release
+        if: inputs.release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # No `v` prefix on purpose: pushing a `v*` tag would also trigger
+          # upstream's release.yml inside this fork.
+          tag="fork-${VERSION:-$(date -u +%Y%m%d-%H%M%S)}-${{ inputs.platform }}"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "Fork build $tag" --generate-notes \
+            $(find "target/$TARGET/release/bundle" -type f \
+              \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.AppImage' \
+                 -o -name '*.deb' -o -name '*.rpm' -o -name '*.msi' -o -name '*.exe' \))
