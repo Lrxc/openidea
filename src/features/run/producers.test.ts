@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as projectRoots from "@/platform/projectRoots";
 import type { HierarchyItem, RunConfig } from "@/platform/ipc";
 import {
   innermostTarget,
@@ -8,6 +9,7 @@ import {
   produceContextChoices,
   produceDirectory,
   produceFile,
+  produceFuzz,
   shebang,
   shellWord,
   fileTargets,
@@ -70,6 +72,7 @@ const ALL = env({
   "clang++": null,
   dart: null,
   elixir: null,
+  escript: null,
   "scala-cli": null,
   deno: "2.1.0",
   bun: "1.1.0",
@@ -137,9 +140,21 @@ describe("single-file producers (scratches)", () => {
     expect(produceContext(input, { ...ALL, deno: true })!.config!.debugAdapter).toBe("js-debug");
     expect(run(input, { ...ALL, bun: true })).toMatchObject({ command: "/bin/bun", args: ["run", "scripts/x.ts"] });
     // Bun's inspector is WebKit-only: js-debug can't attach.
-    expect(produceContext(input, { ...ALL, bun: true })!.config!.debugAdapter).toBeNull();
+    expect(produceContext(input, { ...ALL, bun: true })!.config!.debugAdapter).toBe("bun-dap");
     // Not for scratches outside the project.
     expect(run(scratch("x.ts"), { ...ALL, deno: true })).toMatchObject({ command: "/bin/node" });
+  });
+
+  it("a preferred runtime runs scratches too, and a missing one is reported, not replaced", () => {
+    expect(run(scratch("x.ts"), { ...ALL, bun: true, preferred: true })).toMatchObject({
+      command: "/bin/bun",
+      args: ["run", "x.ts"],
+    });
+    const noBun = env({ node: "24.11.0" }, { bun: true, preferred: true });
+    expect(produceContext(scratch("x.ts"), noBun)!.missing!.body).toContain("Bun was not found");
+    // From project markers only, a missing runtime still falls back to Node.js.
+    const input: ContextInput = { path: `${ROOT}/scripts/x.js`, root: ROOT, configs: [] };
+    expect(run(input, env({ node: "24.11.0" }, { deno: true }))).toMatchObject({ command: "/bin/node" });
   });
 
   it("Python: the interpreter from settings, then the project's, then python3", () => {
@@ -244,6 +259,10 @@ describe("single-file producers (scratches)", () => {
     expect(run(scratch("a.swift"))).toMatchObject({ command: "/bin/swift", args: ["a.swift"] });
     expect(run(scratch("a.dart"))).toMatchObject({ command: "/bin/dart", args: ["run", "a.dart"] });
     expect(run(scratch("a.exs"))).toMatchObject({ command: "/bin/elixir", args: ["a.exs"] });
+    expect(run(scratch("tool.escript"))).toMatchObject({
+      command: "/bin/escript",
+      args: ["tool.escript"],
+    });
     expect(run(scratch("a.sc"))).toMatchObject({ command: "/bin/scala-cli", args: ["run", "a.sc"] });
     expect(run(scratch("a.kts"))).toMatchObject({ command: "/bin/kotlin", args: ["a.kts"] });
     expect(run(scratch("a.kts"), env({ kotlinc: null }))).toMatchObject({
@@ -271,6 +290,82 @@ describe("single-file producers (scratches)", () => {
       ALL,
     )!;
     expect(p.config).toMatchObject({ args: ["run", "./cmd/tool"] });
+  });
+
+  it("Go: nested modules win over previous single-file runs", () => {
+    const go = [
+      cfg({
+        id: "context:file:fixtures/go-app/cmd/server/main.go",
+        kind: "go",
+        args: ["run", "fixtures/go-app/cmd/server/main.go"],
+      }),
+      cfg({
+        id: "go:run:server:fixtures/go-app",
+        kind: "go",
+        args: ["run", "./cmd/server"],
+        cwd: "fixtures/go-app",
+      }),
+    ];
+    const input = {
+      path: `${ROOT}/fixtures/go-app/cmd/server/main.go`,
+      root: ROOT,
+      configs: go,
+      content: "package main\nfunc main() {}",
+    };
+    for (const line of [undefined, 1]) {
+      expect(produceContext({ ...input, line }, ALL)?.config).toMatchObject({
+        id: "go:run:server:fixtures/go-app",
+        args: ["run", "./cmd/server"],
+        cwd: "fixtures/go-app",
+      });
+    }
+  });
+
+  it("Go: single-file runs never become module configurations", () => {
+    const input = {
+      path: `${ROOT}/standalone/main.go`,
+      root: ROOT,
+      configs: [] as RunConfig[],
+      content: "package main\nfunc main() {}",
+    };
+    const first = produceContext(input, ALL)!;
+    expect(first.config).toMatchObject({ id: "context:file:standalone/main.go", args: ["run", "standalone/main.go"] });
+    expect(produceContext({ ...input, configs: [first.config!] }, ALL)?.config).toEqual(first.config);
+  });
+
+  it("Go: typed modules own only their own files", () => {
+    const configs = [
+      ...["api", "worker"].map((module) =>
+        cfg({
+          id: `go:run:${module}`,
+          kind: "go",
+          args: ["build", "-race", "."],
+          params: { module, goKind: "build", scope: "package", target: ".", toolArgs: "-race" },
+        }),
+      ),
+    ];
+    for (const module of ["api", "worker"]) {
+      expect(
+        produceContext(
+          {
+            path: `${ROOT}/${module}/cmd/server/main.go`,
+            root: ROOT,
+            configs,
+            content: "package main\nfunc main() {}",
+          },
+          ALL,
+        )?.config,
+      ).toMatchObject({
+        args: ["build", "-race", "./cmd/server"],
+        params: { module, target: "./cmd/server", goKind: "build", runAfterBuild: "true" },
+      });
+    }
+    expect(
+      produceContext(
+        { path: `${ROOT}/standalone/main.go`, root: ROOT, configs, content: "package main\nfunc main() {}" },
+        ALL,
+      )?.config,
+    ).toMatchObject({ id: "context:file:standalone/main.go", args: ["run", "standalone/main.go"] });
   });
 
   it("Rust: rustc into the compile directory, then the binary; codelldb debugs the binary", () => {
@@ -309,6 +404,82 @@ describe("single-file producers (scratches)", () => {
     expect(produceContext(scratch("calc.rs", src, 2), ALL)!.config!.command).toMatch(/-test tests::$/);
     // Outside: the file (main).
     expect(produceContext(scratch("calc.rs", src, 0), ALL)!.name).toBe("calc.rs");
+  });
+
+  it("Zig: zig run a main, zig test one test with --test-filter; debugging builds the binary first", () => {
+    const src = [
+      'const std = @import("std");',
+      "pub fn main() !void {}",
+      'test "adds two numbers" {',
+      "    try std.testing.expect(true);",
+      "}",
+      "const S = struct {",
+      "    test named {}",
+      "};",
+    ].join("\n");
+    const e = env({ zig: "0.17.1" });
+    const main = produceContext(scratch("calc.zig", src, 1), e)!;
+    expect(main).toMatchObject({ name: "calc.zig", scope: "element" });
+    expect(main.config).toMatchObject({ kind: "zig", command: "/bin/zig", args: ["run", "calc.zig"], cwd: SCRATCH });
+    expect(main.debug!.build.command).toMatch(
+      /^mkdir -p \/tmp\/openidea-run && \/bin\/zig build-exe calc\.zig -femit-bin=\/tmp\/openidea-run\/calc-\w+$/,
+    );
+    expect(main.debug!.config).toMatchObject({
+      kind: "native",
+      debugAdapter: "codelldb",
+      args: [],
+      params: { language: "zig" },
+    });
+
+    const test = produceContext(scratch("calc.zig", src, 3), e)!;
+    expect(test).toMatchObject({ name: "adds two numbers", scope: "element" });
+    expect(test.config).toMatchObject({
+      args: ["test", "calc.zig", "--test-filter", "adds two numbers"],
+      isTest: true,
+    });
+    expect(test.debug!.build.command).toMatch(
+      /zig test calc\.zig --test-filter 'adds two numbers' --test-no-exec -femit-bin=\S+-test$/,
+    );
+    expect(produceContext(scratch("calc.zig", src, 6), e)!.config!.args).toEqual([
+      "test",
+      "calc.zig",
+      "--test-filter",
+      "named",
+    ]);
+    expect(fileTargets(scratch("calc.zig"), src).map((t) => [t.kind, t.name, t.line])).toEqual([
+      ["main", "main", 1],
+      ["test", "adds two numbers", 2],
+      ["test", "named", 6],
+    ]);
+    // A file with tests only runs them all; without Zig, how to install it.
+    expect(produceFile(scratch("lib.zig", 'test "x" {}'), e)!.config!.args).toEqual(["test", "lib.zig"]);
+    expect(produceContext(scratch("calc.zig", src, 1), env({}))!.missing!.body).toMatch(/ziglang\.org/);
+  });
+
+  it("Zig in a build.zig project: a file's main runs its executable, built first", () => {
+    const configs = [
+      cfg({ id: "zig:build", kind: "zig", command: "zig", args: ["build"] }),
+      cfg({
+        id: "zig:exe:app",
+        name: "app",
+        kind: "zig-application",
+        command: "./zig-out/bin/app",
+        debugAdapter: "codelldb",
+        params: { source: "src/main.zig" },
+      }),
+    ];
+    const input = (path: string): ContextInput => ({
+      path: `${ROOT}/${path}`,
+      root: ROOT,
+      configs,
+      content: "pub fn main() void {}",
+    });
+    expect(produceFile(input("src/main.zig"), env({ zig: null }))!.config!.id).toBe("zig:exe:app");
+    // Not an executable's root: the file on its own.
+    expect(produceFile(input("tools/gen.zig"), env({ zig: null }))!.config).toMatchObject({
+      args: ["run", "tools/gen.zig"],
+      cwd: null,
+    });
   });
 
   it("Rust in a Cargo project: cargo run --bin / --example, not rustc", () => {
@@ -736,6 +907,15 @@ describe("project producers", () => {
     expect(
       produceDirectory({ path: `${ROOT}/src/test/java/com/acme`, root: ROOT, configs: gradle })!.config!.args,
     ).toEqual(["test", "--tests", "com.acme.*"]);
+    // A module's tests run from the build root so `./gradlew` resolves,
+    // qualified by the module's Gradle path.
+    const dir = produceDirectory({ path: `${ROOT}/services/api/src/test/java`, root: ROOT, configs: gradle })!;
+    expect(dir.config).toMatchObject({ cwd: null });
+    expect(dir.config!.args).toEqual([":services:api:test"]);
+    expect(
+      produceDirectory({ path: `${ROOT}/services/api/src/test/java/com/acme`, root: ROOT, configs: gradle })!.config!
+        .args,
+    ).toEqual([":services:api:test", "--tests", "com.acme.*"]);
     expect(produceDirectory({ path: `${ROOT}/src/main`, root: ROOT, configs })).toBeNull();
     expect(produceDirectory({ path: ROOT, root: ROOT, configs })).toBeNull();
   });
@@ -963,6 +1143,57 @@ describe("Go test names (GoLand)", () => {
   });
 });
 
+describe("Go Run with Fuzzing (GoLand)", () => {
+  const GO = [
+    cfg({ id: "go:test", kind: "go", command: "go", args: ["test", "./..."], isTest: true, debugAdapter: "delve" }),
+  ];
+  const src = [
+    "package parse", // 0
+    'import "testing"',
+    "func TestParse(t *testing.T) {}", // 2
+    "func BenchmarkParse(b *testing.B) {}",
+    "func ExampleParse() {}",
+    "func FuzzParse(f *testing.F) {", // 5
+    '\tf.Add("x")',
+    "\tf.Fuzz(func(t *testing.T, s string) {", // 7
+    "\t})",
+    "}",
+    "func helper() {}", // 10
+  ].join("\n");
+  const modules = (dir: string) => (dir === ROOT ? "example.com/fixture" : undefined);
+  const at = (line: number | undefined, path = `${ROOT}/internal/parse/parse_test.go`, content = src) =>
+    produceFuzz({ path, root: ROOT, configs: GO, content, line, goModule: modules }, ALL);
+
+  it("the Fuzz function at the caret, its body included, fuzzes its package", () => {
+    for (const line of [5, 7]) {
+      const p = at(line)!;
+      expect(p.name).toBe("FuzzParse in example.com/fixture/internal/parse");
+      expect(p.config).toMatchObject({
+        args: ["test", "./internal/parse", "-run", "^FuzzParse$", "-fuzz", "^FuzzParse$"],
+        name: "FuzzParse in example.com/fixture/internal/parse (fuzzing)",
+        isTest: true,
+      });
+    }
+    expect(at(5, `${ROOT}/parse_test.go`)!.config!.args).toEqual([
+      "test",
+      ".",
+      "-run",
+      "^FuzzParse$",
+      "-fuzz",
+      "^FuzzParse$",
+    ]);
+  });
+
+  it("nothing for tests, benchmarks, examples, other code or the file", () => {
+    for (const line of [0, 2, 3, 4, 10, undefined]) expect(at(line)).toBeNull();
+    // Not a test file: `go test` doesn't build its Fuzz functions as fuzz targets.
+    expect(at(5, `${ROOT}/internal/parse/parse.go`)).toBeNull();
+    // `Fuzzer` is not a fuzz target name; a Fuzz function needs a *testing.F.
+    const misnamed = "package p\nfunc Fuzzer(f *testing.F) {}\nfunc FuzzT(t *testing.T) {}";
+    for (const line of [1, 2]) expect(at(line, undefined, misnamed)).toBeNull();
+  });
+});
+
 describe("CMake file context", () => {
   const configure = cfg({
     id: "cmake:build:configure",
@@ -1002,4 +1233,110 @@ describe("CMake file context", () => {
     expect(p?.config).toBeUndefined();
     expect(p?.missing?.body).toContain("CMake Configure");
   });
+});
+
+describe("module ownership across languages", () => {
+  it.each([
+    ["npm", "other.test.ts", ["run", "test"]],
+    ["deno", "other.test.ts", ["test"]],
+    ["cargo", "tests/other.rs", ["test"]],
+    ["go", "other_test.go", ["test", "./..."]],
+    ["phpunit", "OtherTest.php", []],
+    ["rspec", "other_spec.rb", []],
+    ["maven", "OtherTest.java", ["test"]],
+    ["gradle", "OtherTest.kt", ["test"]],
+  ])("%s never borrows a sibling test configuration", (kind, file, args) => {
+    const configs = [cfg({ id: "sibling", kind, args, cwd: "apps/one", isTest: true })];
+    const result = produceFile({ root: ROOT, path: `${ROOT}/apps/two/${file}`, configs }, OPTIMISTIC);
+    expect(result?.config?.id ?? "").not.toContain("sibling");
+  });
+
+  it("selects the nearest Python interpreter and ignores temporary configs", () => {
+    const configs = [
+      cfg({
+        id: "one",
+        kind: "pytest",
+        command: "/env/one/bin/pytest",
+        cwd: "one",
+        isTest: true,
+      }),
+      cfg({
+        id: "two",
+        kind: "pytest",
+        command: "/env/two/bin/pytest",
+        cwd: "two",
+        isTest: true,
+      }),
+      cfg({
+        id: "context:old",
+        kind: "python",
+        command: "/env/stale/python",
+        cwd: "two",
+      }),
+    ];
+    expect(produceFile({ root: ROOT, path: `${ROOT}/two/main.py`, configs }, OPTIMISTIC)?.config?.command).toBe(
+      "/env/two/bin/python",
+    );
+  });
+
+  it("a Cargo package owns its binary even when commands run at the workspace root", () => {
+    const configs = [
+      cfg({
+        id: "cargo:run:one",
+        kind: "cargo",
+        module: "crates/one",
+        args: ["run", "-p", "one", "--bin", "server"],
+      }),
+      cfg({
+        id: "workspace:member:cargo:run:two",
+        kind: "cargo",
+        module: "crates/two",
+        args: ["run", "-p", "two", "--bin", "server"],
+      }),
+    ];
+    const result = produceFile({ root: ROOT, path: `${ROOT}/crates/two/src/bin/server.rs`, configs }, OPTIMISTIC);
+    expect(result?.config?.args).toEqual(configs[1]!.args);
+    expect(result?.config?.cwd).toBeNull();
+  });
+
+  it.each(["/work/app", "C:/work/app"])("matches absolute workspace configs under %s", (root) => {
+    const configs = [
+      cfg({
+        id: "test",
+        kind: "npm",
+        cwd: `${root}/apps/web`,
+        module: `${root}/apps/web`,
+        args: ["run", "test"],
+        isTest: true,
+      }),
+    ];
+    const result = produceFile({ root, path: `${root}/apps/web/a.test.ts`, configs }, OPTIMISTIC);
+    expect(result?.config).toMatchObject({
+      cwd: "apps/web",
+      args: ["run", "test", "--", "a.test.ts"],
+    });
+  });
+});
+
+it("runs scripts from their owning module with arguments relative to that directory", () => {
+  const configs = [cfg({ id: "web", kind: "npm", cwd: "apps/web", module: "apps/web" })];
+  expect(produceFile({ root: ROOT, path: `${ROOT}/apps/web/src/main.js`, configs }, OPTIMISTIC)?.config).toMatchObject({
+    cwd: "apps/web",
+    args: ["src/main.js"],
+  });
+});
+
+it("nested Ruby scripts use their own source paths relative to their cwd", () => {
+  const spy = vi.spyOn(projectRoots, "currentRoots").mockReturnValue([
+    { path: "apps/ruby/lib", kind: "source", detectedFrom: null },
+    { path: "apps/other/lib", kind: "source", detectedFrom: null },
+  ]);
+  try {
+    const configs = [cfg({ id: "ruby", kind: "rake", cwd: "apps/ruby", args: ["test"] })];
+    expect(
+      produceFile({ root: ROOT, path: `${ROOT}/apps/ruby/bin/main.rb`, configs }, OPTIMISTIC)?.config,
+    ).toMatchObject({ cwd: "apps/ruby", args: ["-Ilib", "bin/main.rb"] });
+  } finally {
+    spy.mockRestore();
+  }
 });

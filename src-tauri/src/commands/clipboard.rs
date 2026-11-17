@@ -1,12 +1,57 @@
 //! The OS clipboard's file list, so the project view and Explorer exchange files.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use crate::commands::doc::blocking;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use ide_core::IdeError;
 use ide_core::IdeResult;
 use std::path::{Path, PathBuf};
-use tauri::AppHandle;
+use tauri::{AppHandle, WebviewWindow};
+
+/// Writes text locally, without WebView user-activation requirements.
+#[tauri::command]
+#[specta::specta]
+pub async fn clipboard_write_text(app: AppHandle, window: WebviewWindow, text: String) -> IdeResult<()> {
+    #[cfg(windows)]
+    let owner = window.hwnd().map_err(|error| ide_core::IdeError::internal(error.to_string()))?.0 as usize;
+    #[cfg(not(windows))]
+    let owner = {
+        let _ = window;
+        0
+    };
+    with_clipboard(app, move || ide_clipboard::set_text(&text, owner).map_err(ide_core::IdeError::from)).await
+}
+
+/// The clipboard's plain text, read natively as [`clipboard_write_text`] writes it: a Paste
+/// from a menu has no paste event, and WebKitGTK gives `navigator.clipboard.readText()` no
+/// text there (#3041). None on Windows, where the WebView's clipboard is used.
+#[tauri::command]
+#[specta::specta]
+pub async fn clipboard_text(app: AppHandle) -> IdeResult<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let sender = std::cell::Cell::new(Some(tx));
+            gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).request_text(move |_, text| {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(text.map(|t| t.to_string()));
+                }
+            });
+        })
+        .map_err(|error| IdeError::internal(format!("Cannot dispatch clipboard access to the main thread: {error}")))?;
+        Ok(rx.await.ok().flatten())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        with_clipboard(app, || Ok(ide_clipboard::text())).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = app;
+        Ok(None)
+    }
+}
 
 /// Absolute paths on the clipboard, empty when it holds no file list.
 #[tauri::command]
@@ -31,13 +76,54 @@ pub async fn clipboard_set_file_list(app: AppHandle, paths: Vec<PathBuf>) -> Ide
     with_clipboard(app, move || Ok(ide_clipboard::set_files(&paths))).await
 }
 
+/// Whether the clipboard holds an image (a screenshot): cheap, for the Paste item's
+/// enabled state.
+#[tauri::command]
+#[specta::specta]
+pub fn clipboard_has_image() -> bool {
+    // Synchronous Tauri commands run on the main thread, as macOS and GTK require.
+    ide_clipboard::has_image()
+}
+
+/// The clipboard's image as a PNG data URL: for a paste whose event carried no files
+/// (WebKitGTK leaves `clipboardData` empty for a raw image, a screenshot), and for
+/// the project view's Paste, which has no paste event. None when it holds no image.
+#[tauri::command]
+#[specta::specta]
+pub async fn clipboard_image(app: AppHandle) -> IdeResult<Option<String>> {
+    use base64::Engine;
+    let data_url =
+        |bytes: Vec<u8>| format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let sender = std::cell::Cell::new(Some(tx));
+            gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).request_image(move |_, pixbuf| {
+                let png = pixbuf.and_then(|image| image.save_to_bufferv("png", &[]).ok());
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(png);
+                }
+            });
+        })
+        .map_err(|error| {
+            ide_core::IdeError::internal(format!("Cannot dispatch clipboard access to the main thread: {error}"))
+        })?;
+        Ok(rx.await.ok().flatten().map(data_url))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(with_clipboard(app, || Ok(ide_clipboard::png())).await?.map(data_url))
+    }
+}
+
 /// AppKit and WebKit share the general pasteboard, so a worker-side mutex cannot
 /// protect its type cache. Await the main thread without blocking a command thread.
 async fn with_clipboard<T: Send + 'static>(
     app: AppHandle,
     f: impl FnOnce() -> IdeResult<T> + Send + 'static,
 ) -> IdeResult<T> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         app.run_on_main_thread(move || {
@@ -46,7 +132,7 @@ async fn with_clipboard<T: Send + 'static>(
         .map_err(|error| IdeError::internal(format!("Cannot dispatch clipboard access to the main thread: {error}")))?;
         rx.await.map_err(|error| IdeError::internal(format!("Clipboard main-thread task was dropped: {error}")))?
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = app;
         blocking(f).await

@@ -10,18 +10,28 @@
  * globally installed tools.
  */
 import type { RunConfig } from "@/platform/ipc";
+import { ipcPath, isSameOrInside } from "@/platform/paths";
 import { isTestPath } from "@/platform/languageSettings";
 import { currentRoots } from "@/platform/projectRoots";
 import { applicationConfig, jvmModuleDir } from "./application";
+import { useBuildModel } from "@/platform/buildModel";
 import { formatArgs } from "./configs";
 import { goGenerateConfig } from "./goGenerate";
 import { goTestParts } from "./goArguments";
-import { contextConfig, fileRole, projectPython, testBasesFor, testConfigFor } from "./context";
+import {
+  allClosest,
+  contextConfig,
+  fileRole,
+  projectPython,
+  testBasesFor,
+  testConfigFor,
+  relToCwd as relativeToCwd,
+} from "./context";
 import { djangoLabel, djangoTestsOf, hasDjangoTests } from "./djangoTypes";
 import { firstTopLevelType, scanJvmTargets, simpleClassName } from "./jvmTargets";
 import { isWindows } from "./jvmTypes";
 import { inheritedRunTargets } from "./inheritedMain";
-import { detectRunTargets, targetConfig, targetLanguage, type RunTarget } from "./targets";
+import { detectRunTargets, goFuzzConfig, targetConfig, targetLanguage, zigTargets, type RunTarget } from "./targets";
 import { tx } from "@/platform/i18n";
 
 export interface LocatedTool {
@@ -40,9 +50,11 @@ export interface ToolEnv {
   python?: string | null;
   /** The PHP interpreter chosen in settings (else the `php` on `PATH`). */
   php?: string | null;
-  /** The project root has `deno.json(c)` / `bun.lock(b)`. */
+  /** Run JavaScript / TypeScript with Deno / Bun: the project has `deno.json(c)` / `bun.lock(b)`, or `preferred`. */
   deno?: boolean;
   bun?: boolean;
+  /** Deno / Bun was chosen as the preferred runtime, so it also runs files outside the project. */
+  preferred?: boolean;
 }
 
 /** Names only: every tool unknown. */
@@ -103,6 +115,29 @@ function relTo(path: string, root: string | null): string {
   return root && path.startsWith(root + "/") ? path.slice(root.length + 1) : path;
 }
 
+function scopedInput<T extends Pick<ContextInput, "root" | "configs">>(input: T): T {
+  const root = input.root && ipcPath(input.root).replace(/\/+$/, "");
+  if (!root) return input;
+  const relative = (value: string) => {
+    const path = ipcPath(value);
+    return path === root ? "" : path.startsWith(root + "/") ? path.slice(root.length + 1) : path;
+  };
+  return {
+    ...input,
+    configs: input.configs.map((c) => ({
+      ...c,
+      cwd: c.cwd == null ? c.cwd : relative(c.cwd),
+      ...(c.module == null ? {} : { module: relative(c.module) }),
+      ...(c.kind.startsWith("dotnet") && c.params?.project
+        ? { params: { ...c.params, project: relative(c.params.project) } }
+        : {}),
+      ...(c.kind === "go" && c.params?.module != null
+        ? { params: { ...c.params, module: relative(c.params.module) } }
+        : {}),
+    })),
+  };
+}
+
 /** Short stable hash, so compiled binaries of same-named files don't collide. */
 function hash(s: string): string {
   let h = 5381;
@@ -136,7 +171,7 @@ function mkdirLine(dir: string, windows = false): string {
 /** Absolute directory of a configuration's working directory (a Go module). */
 export function goModuleDir(root: string, cwd: string | null): string {
   const rel = (cwd ?? "").replace(/^\.(?:\/|$)/, "").replace(/\/+$/, "");
-  if (rel.startsWith("/")) return rel;
+  if (rel.startsWith("/") || /^[A-Za-z]:\//.test(rel)) return rel;
   return rel ? `${root}/${rel}` : root;
 }
 
@@ -187,7 +222,9 @@ export type ScriptLanguage =
   | "cpp"
   | "dart"
   | "elixir"
+  | "escript"
   | "scala"
+  | "zig"
   | "shebang";
 
 /** `#!/usr/bin/env -S deno run` → `["deno", "run"]`; `#!/bin/zsh -f` → `["/bin/zsh", "-f"]`. */
@@ -226,7 +263,9 @@ export function scriptLanguage(path: string, content?: string): ScriptLanguage |
   if (/\.(cpp|cc|cxx|c\+\+)$/.test(name)) return "cpp";
   if (/\.dart$/.test(name)) return "dart";
   if (/\.exs$/.test(name)) return "elixir";
+  if (/\.escript$/.test(name)) return "escript";
   if (/\.(scala|sc)$/.test(name)) return "scala";
+  if (/\.zig$/.test(name)) return "zig";
   if (!name.includes(".") && shebang(content)) return "shebang";
   return null;
 }
@@ -280,8 +319,12 @@ export function toolsFor(lang: ScriptLanguage, content?: string): string[] {
       return ["dart"];
     case "elixir":
       return ["elixir"];
+    case "escript":
+      return ["escript"];
     case "scala":
       return ["scala-cli"];
+    case "zig":
+      return ["zig"];
   }
 }
 
@@ -305,7 +348,9 @@ const INSTALL: Record<string, string> = {
   cpp: "Install a C++ compiler: `xcode-select --install` (clang++) or `brew install gcc`.",
   dart: "Install the Dart SDK (`brew install dart-sdk`).",
   elixir: "Install Elixir (`brew install elixir`).",
+  escript: "Install Erlang/OTP (`brew install erlang`).",
   scala: "Install Scala CLI (`brew install Virtuslab/scala-cli/scala-cli`).",
+  zig: "Install Zig from https://ziglang.org/download (or `brew install zig`).",
   shell: "Install the shell named in the script's #! line.",
   shebang: "Install the interpreter named in the script's #! line.",
 };
@@ -323,6 +368,7 @@ const LANGUAGE_NAMES: Partial<Record<ScriptLanguage, string>> = {
   c: "A C compiler",
   cpp: "A C++ compiler",
   scala: "Scala CLI",
+  zig: "Zig",
 };
 
 function missing(lang: ScriptLanguage, file: string, tools: string[]): Missing {
@@ -384,10 +430,26 @@ function isProjectPath(input: Pick<ContextInput, "path" | "root" | "contentRoots
 function site(input: ContextInput): FileSite {
   const inside = isProjectPath(input);
   const rel = relTo(input.path, input.root);
+  const language = scriptLanguage(input.path, input.content);
+  const kinds: Record<string, string[]> = {
+    js: ["npm", "deno", "bun", "node"],
+    ts: ["npm", "deno", "bun", "node"],
+    python: ["python", "pytest", "django-test"],
+    ruby: ["ruby", "rake", "rspec"],
+    php: ["php", "phpunit", "composer"],
+    zig: ["zig", "zig-application"],
+  };
+  const owner =
+    inside && language
+      ? allClosest(
+          input.configs.filter((c) => kinds[language]?.includes(c.kind)),
+          rel,
+        )[0]
+      : undefined;
   return {
     idPath: rel,
-    arg: inside ? rel : baseName(input.path),
-    cwd: inside ? null : dirName(input.path),
+    arg: inside ? (owner ? relativeToCwd(rel, owner) : rel) : baseName(input.path),
+    cwd: inside ? owner?.cwd || null : dirName(input.path),
     file: baseName(input.path),
     inProject: inside,
   };
@@ -442,29 +504,48 @@ function pythonModule(input: ContextInput): { name: string; dir: string } | null
 /** Python: the interpreter from settings, the detected project interpreter, then `python3` on the PATH. */
 function pythonCommand(input: ContextInput, env: ToolEnv, s: FileSite): { command: string; prefix: string[] } | null {
   if (env.python) return { command: env.python, prefix: [] };
-  const py = projectPython([...input.configs]);
+  const py = projectPython([...input.configs], relTo(input.path, input.root));
   if (py) {
     // A venv-relative interpreter is relative to the project root.
+    const owner = allClosest(
+      input.configs.filter((c) => ["python", "pytest", "django-test"].includes(c.kind)),
+      relTo(input.path, input.root),
+    )[0];
+    const cwd = owner?.cwd ?? "";
+    const relativeCommand = py.command.includes("/") && !py.command.startsWith("/") && !/^[A-Za-z]:/.test(py.command);
     const command =
-      !s.inProject && input.root && py.command.includes("/") && !py.command.startsWith("/")
-        ? `${input.root}/${py.command.replace(/^\.\//, "")}`
-        : py.command;
+      relativeCommand && cwd
+        ? `${goModuleDir(input.root ?? "", cwd)}/${py.command.replace(/^\.\//, "")}`
+        : !s.inProject && input.root && relativeCommand
+          ? `${input.root}/${py.command.replace(/^\.\//, "")}`
+          : py.command;
     return { command, prefix: py.prefix };
   }
   const t = pick(env, ["python3", "python"]);
   return t ? { command: t.command, prefix: [] } : null;
 }
 
+/** The preferred runtime is not installed: say so rather than run the file with another one. */
+function preferredMissing(file: string, runtime: string, command: string, site: string): Missing {
+  return {
+    title: tx`Cannot run '${file}'`,
+    body: tx`${runtime} was not found (looked for \`${command}\`). Install it from ${site}, or choose another preferred runtime in Settings › Languages & Frameworks › JavaScript Runtime.`,
+  };
+}
+
 function jsRuntime(lang: "js" | "ts", env: ToolEnv, s: FileSite): Produced {
   const name = s.file;
   const ok = (config: RunConfig): Produced => ({ name, scope: "file", config });
-  if (s.inProject && env.deno) {
+  if ((s.inProject || env.preferred) && env.deno) {
     const deno = pick(env, ["deno"]);
     if (deno) return ok(fileConfig(s, "deno", deno.command, ["run", s.arg], "js-debug"));
+    if (env.preferred)
+      return { name, scope: "file", missing: preferredMissing(name, "Deno", "deno", "https://deno.com") };
   }
-  if (s.inProject && env.bun) {
+  if ((s.inProject || env.preferred) && env.bun) {
     const bun = pick(env, ["bun"]);
-    if (bun) return ok(fileConfig(s, "bun", bun.command, ["run", s.arg]));
+    if (bun) return ok(fileConfig(s, "bun", bun.command, ["run", s.arg], "bun-dap"));
+    if (env.preferred) return { name, scope: "file", missing: preferredMissing(name, "Bun", "bun", "https://bun.sh") };
   }
   const node = env.tool("node");
   const nodeCmd = node === undefined ? "node" : (node?.path ?? null);
@@ -547,6 +628,59 @@ function compiled(
 }
 
 /**
+ * A Zig file: `zig run` its `main`, `zig test` its tests (one of them with `--test-filter`). Debugging
+ * builds the same file into a binary (`build-exe`, or `test --test-no-exec`) and launches that.
+ */
+function zigFile(input: ContextInput, env: ToolEnv, s: FileSite, test?: { name: string; filter?: string }): Produced {
+  const win = !!env.windows;
+  const name = test?.name ?? s.file;
+  const scope = test?.filter !== undefined ? "element" : "file";
+  const zig = pick(env, toolsFor("zig"));
+  if (!zig) return { name, scope, missing: missing("zig", s.file, toolsFor("zig")) };
+  const filter = test?.filter !== undefined ? ["--test-filter", test.filter] : [];
+  const idPath = test?.filter !== undefined ? `${s.idPath}#${test.filter}` : s.idPath;
+  const dir = env.compileDir.replace(/\\/g, "/").replace(/(.)\/+$/, "$1");
+  const out = nativePath(
+    `${dir}/${stemOf(s.file)}-${hash(input.path + (test?.filter ?? ""))}${test ? "-test" : ""}${win ? ".exe" : ""}`,
+    win,
+  );
+  const config: RunConfig = {
+    ...fileConfig(s, "zig", zig.command, test ? ["test", s.arg, ...filter] : ["run", s.arg], "codelldb"),
+    id: `context:file:${idPath}`,
+    name,
+    isTest: !!test,
+  };
+  const compile = test ? ["test", s.arg, ...filter, "--test-no-exec"] : ["build-exe", s.arg];
+  const buildConfig: RunConfig = {
+    ...config,
+    id: `context:build:${idPath}`,
+    name: `Build ${s.file}`,
+    command: `${mkdirLine(dir, win)} && ${shellLine([zig.command, ...compile, `-femit-bin=${out}`], win)}`,
+    args: [],
+    isTest: false,
+    debugAdapter: null,
+  };
+  const binary: RunConfig = {
+    ...config,
+    kind: "native",
+    command: out,
+    args: [],
+    isTest: false,
+    // Marks the debugged program as Zig: CodeLLDB's source mode stays off (see nativeLaunch).
+    params: { language: "zig" },
+  };
+  return { name, scope, config, debug: { build: buildConfig, config: binary } };
+}
+
+/** The executable of the file's `build.zig` whose root source file it is. */
+function zigExecutable(rel: string, configs: readonly RunConfig[]): RunConfig | undefined {
+  return buildOwners(rel, configs, ["zig-application"]).find((c) => c.params?.source === relativeToCwd(rel, c));
+}
+
+const hasZigMain = (content?: string) => content === undefined || /^pub\s+fn\s+main\s*\(/m.test(content);
+const hasZigTests = (content?: string) => content !== undefined && /^\s*test\s+("|[A-Za-z_])/m.test(content);
+
+/**
  * A single Java file. The source launcher (`java Hi.java`, JEP 330) runs the file's first
  * top-level type, so another main class (declared after it, nested, or picked in the gutter)
  * is compiled with the JDK's `javac` into a class directory and run with `java -cp`.
@@ -599,8 +733,20 @@ function simple(
 }
 
 /** `-I<dir>` for each Sources root of the project (the project root itself is already the cwd). */
-const rubyLoadPath = (roots: readonly { path: string; kind: string }[]): string[] =>
-  roots.filter((r) => r.kind === "source" && r.path !== "").map((r) => `-I${r.path}`);
+const rubyLoadPath = (
+  roots: readonly { path: string; kind: string }[],
+  cwd: string | null,
+  root: string | null,
+): string[] =>
+  roots
+    .filter((r) => r.kind === "source" && r.path !== "")
+    .flatMap((r) => {
+      if (!cwd) return [`-I${r.path}`];
+      const dir = goModuleDir(root ?? "", cwd);
+      const source = goModuleDir(root ?? "", r.path);
+      if (!isSameOrInside(source, dir)) return [];
+      return [`-I${source === dir ? "." : source.slice(dir.length + 1)}`];
+    });
 
 const hasGoMain = (content?: string) => content === undefined || /^\s*package\s+main\b/m.test(content);
 const hasRustMain = (content?: string) =>
@@ -614,11 +760,10 @@ const hasKotlinMain = (content?: string) => content === undefined || /^(?:suspen
  * directory at or above it): a build nested in a folder of repositories owns only its files.
  */
 function buildOwners(rel: string, configs: readonly RunConfig[], kinds: readonly string[]): RunConfig[] {
-  return configs.filter((c) => {
-    if (!kinds.includes(c.kind)) return false;
-    const cwd = (c.cwd ?? "").replace(/^\.\/?/, "").replace(/\/+$/, "");
-    return !cwd || rel.startsWith(cwd + "/");
-  });
+  return allClosest(
+    configs.filter((c) => kinds.includes(c.kind)),
+    rel,
+  );
 }
 
 const cargoOwner = (rel: string, configs: readonly RunConfig[]) => buildOwners(rel, configs, ["cargo"]);
@@ -655,6 +800,7 @@ function godotScene(rel: string, configs: readonly RunConfig[]): Produced | null
 
 /** The file as a whole: tests of a test file, the project's run target, or the runtime for its language. */
 export function produceFile(input: ContextInput, env: ToolEnv): Produced | null {
+  input = scopedInput(input);
   const s = site(input);
   const lang = scriptLanguage(input.path, input.content);
   const configs = [...input.configs];
@@ -678,19 +824,30 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     // Project-aware: test files through the project's test runner, Cargo / Go / Gradle / Maven mains.
     const role = fileRole(rel, input.content, undefined, hasDjangoTests(configs));
     if (role === "test") {
-      const found = testConfigFor(rel, configs);
+      const found = testConfigFor(rel, configs, undefined, input.content);
       const test = found && goTestNamed(found, input);
       if (test) return { name: test.name, scope: "file", config: test };
     }
     if (lang === "rust" && cargoOwner(rel, configs).length) {
       const example = /(?:^|\/)examples\/([^/]+)\.rs$/.exec(rel)?.[1];
       if (example && hasRustMain(input.content)) {
-        const base = cargoOwner(rel, configs).find((c) => c.id.startsWith("cargo:run")) ?? cargoOwner(rel, configs)[0]!;
+        const base = cargoOwner(rel, configs).find((c) => c.args[0] === "run") ?? cargoOwner(rel, configs)[0]!;
         const config: RunConfig = {
           ...base,
           id: `context:file:${rel}`,
           name: `Run ${example}`,
-          args: ["run", "--example", example],
+          args: [
+            "run",
+            ...base.args.flatMap((arg, i, args) =>
+              ["-p", "--package", "--manifest-path"].includes(arg)
+                ? [arg, args[i + 1]!]
+                : /^(?:--package=|--manifest-path=|-p.)/.test(arg)
+                  ? [arg]
+                  : [],
+            ),
+            "--example",
+            example,
+          ],
           env: { ...base.env },
           isTest: false,
           detected: true,
@@ -701,6 +858,11 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
       if (role !== "main") return null;
       const main = contextConfig(rel, configs, input.content);
       return main ? { name: main.name, scope: "file", config: main } : null;
+    }
+    if (lang === "zig" && hasZigMain(input.content)) {
+      // A `build.zig` executable built from this file: its installed binary, built first.
+      const exe = zigExecutable(rel, configs);
+      if (exe) return { name: exe.name, scope: "file", config: exe };
     }
     if (lang === "go" && hasBuildTool(rel, configs, ["go"])) {
       if (!hasGoMain(input.content)) return null;
@@ -811,7 +973,14 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     }
     case "ruby":
       // Sources roots go on the load path (`-Ilib`), as `rake test` does; paths are project-relative.
-      return simple(lang, s, env, lang, () => [...(s.inProject ? rubyLoadPath(currentRoots()) : []), s.arg]);
+      return simple(
+        lang,
+        s,
+        env,
+        lang,
+        () => [...(s.inProject ? rubyLoadPath(currentRoots(), s.cwd, input.root) : []), s.arg],
+        "rdbg",
+      );
     case "php":
       if (env.php) return { name: s.file, scope: "file", config: fileConfig(s, "php", env.php, [s.arg], "php-debug") };
       return simple(lang, s, env, lang, () => [s.arg], "php-debug");
@@ -819,6 +988,7 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     case "lua":
     case "swift":
     case "elixir":
+    case "escript":
       return simple(lang, s, env, lang, () => [s.arg]);
     case "r":
       return simple(lang, s, env, "r", () => [s.arg]);
@@ -848,6 +1018,10 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     case "c":
     case "cpp":
       return hasCMain(input.content) ? compiled(input, env, s, lang) : null;
+    case "zig":
+      if (hasZigMain(input.content)) return zigFile(input, env, s);
+      // A file with tests only: run them all.
+      return hasZigTests(input.content) ? zigFile(input, env, s, { name: s.file }) : null;
   }
   return null;
 }
@@ -926,9 +1100,11 @@ export function fileTargets(
   input: Pick<ContextInput, "path" | "root" | "configs" | "contentRoots">,
   content: string,
 ): RunTarget[] {
+  input = scopedInput(input);
   const s = { inProject: isProjectPath(input), rel: relTo(input.path, input.root) };
   const rust = /\.rs$/.test(input.path);
   if (/\.(c|cpp|cc|cxx)$/.test(input.path)) return standaloneTargets(content, input.path);
+  if (/\.zig$/.test(input.path)) return zigTargets(content);
   const cargo =
     s.inProject && (cargoOwner(s.rel, input.configs).length > 0 || /(^|\/)(src|tests|examples|benches)\//.test(s.rel));
   if (rust && !cargo) return standaloneTargets(content, input.path);
@@ -962,6 +1138,10 @@ function elementProduction(input: ContextInput, env: ToolEnv, target: RunTarget)
     const file = produceFile(input, env);
     return file ? { ...file, scope: "element" } : null;
   }
+  if (/\.zig$/.test(input.path)) {
+    // `--test-filter` matches a substring of the test's full name.
+    return zigFile(input, env, s, { name: target.name, filter: target.name });
+  }
   const rust = /\.rs$/.test(input.path);
   if (rust && !(s.inProject && cargoOwner(rel, input.configs).length)) {
     const path = target.path.join("::");
@@ -980,6 +1160,7 @@ function elementProduction(input: ContextInput, env: ToolEnv, target: RunTarget)
  * main function — else the file.
  */
 export function produceContext(input: ContextInput, env: ToolEnv): Produced | null {
+  input = scopedInput(input);
   if (input.content !== undefined && input.line !== undefined) {
     const targets = fileTargets(input, input.content.slice(0, 400_000));
     const inner = innermostTarget(input.content, targets, input.line, /\.(py|rb)$/.test(input.path));
@@ -991,12 +1172,24 @@ export function produceContext(input: ContextInput, env: ToolEnv): Produced | nu
   return produceFile(input, env);
 }
 
+/** GoLand's "Run '<name>' with Fuzzing": the `Fuzz` function at the caret, run with `go test -fuzz`. */
+export function produceFuzz(input: ContextInput, env: ToolEnv): Produced | null {
+  input = scopedInput(input);
+  if (input.content === undefined || input.line === undefined || !/_test\.go$/.test(input.path)) return null;
+  const targets = fileTargets(input, input.content.slice(0, 400_000));
+  const inner = innermostTarget(input.content, targets, input.line);
+  const produced = inner && elementProduction(input, env, inner);
+  const config = inner && produced?.config && goFuzzConfig(produced.config, inner);
+  return produced && config ? { ...produced, config } : null;
+}
+
 /**
  * Every configuration that can run the context, when several test
  * configurations match it equally well (`npm run test` and `npm run test:unit`):
  * like IDEA, the user then chooses one. A single production otherwise.
  */
 export function produceContextChoices(input: ContextInput, env: ToolEnv): Produced[] {
+  input = scopedInput(input);
   const produced = produceContext(input, env);
   if (!produced?.config || produced.scope === "directory" || !isProjectPath(input)) return produced ? [produced] : [];
   const rel = relTo(input.path, input.root);
@@ -1016,7 +1209,7 @@ export function produceContextChoices(input: ContextInput, env: ToolEnv): Produc
   for (const base of bases) {
     const found = element
       ? targetConfig(element, rel, [...input.configs], input.content, base)
-      : testConfigFor(rel, [...input.configs], base);
+      : testConfigFor(rel, [...input.configs], base, input.content);
     const config = found && goTestNamed(found, input, element?.name);
     if (!config || out.some((o) => o.config?.id === config.id)) continue;
     out.push({ name: config.name, scope: produced.scope, config, detail: base.name });
@@ -1046,6 +1239,7 @@ function rubyDirectory(
   relToCwd: (c: RunConfig) => string,
   make: (base: RunConfig, label: string, args: string[]) => Produced,
   label: string,
+  root: string | null,
 ): Produced | null {
   const rspec = closest(["rspec"]);
   if (rspec) return make(rspec, label, [...rspec.args, relToCwd(rspec)]);
@@ -1058,13 +1252,35 @@ function rubyDirectory(
   const minitest = closest(["ruby"]);
   if (!minitest) return null;
   const at = minitest.args.indexOf("-e");
-  const flags = rubyLoadPath(currentRoots()).filter((f) => !minitest.args.includes(f));
+  const flags = rubyLoadPath(currentRoots(), minitest.cwd, root).filter((f) => !minitest.args.includes(f));
   const args = [...minitest.args.slice(0, -1)];
   args.splice(at < 0 ? args.length : at, 0, ...flags);
   return make(minitest, label, [...args, relToCwd(minitest)]);
 }
 
+/**
+ * The Gradle build and project path a module directory belongs to, so a module
+ * test run can stay in the build root (where `./gradlew` resolves) and qualify
+ * its task (`:services:api:test`). `null` for non-Gradle bases and modules the
+ * base configuration already runs. Without a loaded model, the Gradle path is
+ * guessed from the directory's segments — right for the standard layout the
+ * wrapper itself implies.
+ */
+function gradleOwnerFor(module: string, base: RunConfig): { dir: string | null; path: string } | null {
+  if (base.kind !== "gradle" || !module || module === base.cwd) return null;
+  const dir = module.replace(/\\/g, "/");
+  const gradle = useBuildModel
+    .getState()
+    .model?.gradle?.find((g) => g.projects.some((p) => p.dir.replace(/\\/g, "/") === dir));
+  const project = gradle?.projects.find((p) => p.dir.replace(/\\/g, "/") === dir);
+  return {
+    dir: gradle?.dir ?? base.cwd,
+    path: project?.path ?? `:${module.split("/").join(":")}`,
+  };
+}
+
 export function produceDirectory(input: ContextInput): Produced | null {
+  input = scopedInput(input);
   const { root } = input;
   if (!root || !isProjectPath(input) || input.path === root) return null;
   const rel = relTo(input.path, root);
@@ -1074,26 +1290,23 @@ export function produceDirectory(input: ContextInput): Produced | null {
   const marked = isTestPath(currentRoots(), rel);
   const tests = input.configs.filter((c) => c.isTest);
   if (!TEST_DIR.test(rel) && !jvmRoot && !jvmPackage && !marked && !/(^|\/)src\/test(\/|$)/.test(rel)) return null;
-  const closest = (kinds: string[]) => {
-    const cands = tests.filter((c) => kinds.includes(c.kind));
-    const score = (c: RunConfig) => {
-      const cwd = (c.cwd ?? "").replace(/^\.\/?/, "").replace(/\/+$/, "");
-      if (!cwd) return 0;
-      return rel === cwd || rel.startsWith(cwd + "/") ? cwd.length : -1;
-    };
-    return cands
-      .map((c) => [c, score(c)] as const)
-      .filter(([, n]) => n >= 0)
-      .sort((a, b) => b[1] - a[1])[0]?.[0];
-  };
-  const relToCwd = (c: RunConfig) => {
-    const cwd = (c.cwd ?? "").replace(/^\.\/?/, "").replace(/\/+$/, "");
-    return cwd && rel.startsWith(cwd + "/") ? rel.slice(cwd.length + 1) : rel === cwd ? "" : rel;
-  };
+  const closest = (kinds: string[]) =>
+    allClosest(
+      tests.filter((c) => kinds.includes(c.kind)),
+      rel,
+    )[0];
+  const relToCwd = (c: RunConfig) => relativeToCwd(rel, c);
   const make = (base: RunConfig, label: string, args: string[]): Produced => ({
     name: label,
     scope: "directory",
-    config: { ...base, id: `context:dir:${base.id}:${rel}`, name: label, args, env: { ...base.env }, detected: true },
+    config: {
+      ...base,
+      id: `context:dir:${base.id}:${rel}`,
+      name: label,
+      args,
+      env: { ...base.env },
+      detected: true,
+    },
   });
   const testsIn = `Tests in '${name}'`;
 
@@ -1101,11 +1314,20 @@ export function produceDirectory(input: ContextInput): Produced | null {
     const base = closest(["gradle", "maven"]);
     if (base) {
       const module = jvmModuleDir(rel + "/x.java", input.configs);
-      const moduleBase = { ...base, cwd: module || base.cwd };
-      if (!jvmPackage) return make(moduleBase, "All Tests", [...base.args]);
+      // Gradle in a multi-module project: run from the build root so the
+      // wrapper (`./gradlew`) resolves, qualifying the task with the module's
+      // Gradle path (`services/api` → `:services:api:test`). Other builds run
+      // in the module directory as before.
+      const owner = gradleOwnerFor(module, base);
+      const moduleBase = { ...base, cwd: owner ? owner.dir : module || base.cwd };
+      const moduleArgs = (base: RunConfig): string[] => {
+        if (!owner) return [...base.args];
+        return base.args.map((a) => (a === "test" ? `${owner.path}:test` : a));
+      };
+      if (!jvmPackage) return make(moduleBase, "All Tests", moduleArgs(base));
       const pkg = jvmPackage[2]!.replace(/\//g, ".");
       return base.kind === "gradle"
-        ? make(moduleBase, `Tests in '${pkg}'`, [...base.args, "--tests", `${pkg}.*`])
+        ? make(moduleBase, `Tests in '${pkg}'`, [...moduleArgs(base), "--tests", `${pkg}.*`])
         : make(moduleBase, `Tests in '${pkg}'`, [
             ...base.args,
             `-Dtest=${pkg}.**.*`,
@@ -1114,7 +1336,7 @@ export function produceDirectory(input: ContextInput): Produced | null {
     }
   }
   const js = closest(["npm", "bun", "deno"]);
-  const ruby = marked && !js && rubyDirectory(closest, relToCwd, make, testsIn);
+  const ruby = marked && !js && rubyDirectory(closest, relToCwd, make, testsIn, root);
   if (ruby) return ruby;
   const py = closest(["pytest"]);
   const django = closest(["django-test"]);

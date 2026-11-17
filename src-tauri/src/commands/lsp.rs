@@ -97,6 +97,22 @@ pub async fn lsp_goto_implementation(
     ide_host::ops::lsp::lsp_goto_implementation(&state.host, window.label(), request, doc, pos, on_partial).await
 }
 
+/// Refines the implementations `targets` of the method at `pos` to their declarations (Java
+/// dependencies' class files point at the start of the class). Cancel with
+/// `cancel_request(request)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn lsp_implementation_locations(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    pos: Pos,
+    targets: Vec<Location>,
+) -> IdeResult<Vec<Location>> {
+    ide_host::ops::lsp::lsp_implementation_locations(&state.host, window.label(), request, doc, pos, targets).await
+}
+
 /// Implementations of the symbols at `positions`, one list per position (the
 /// editor's "is implemented / overridden" gutter markers). Cancel with
 /// `cancel_request(request)`.
@@ -126,6 +142,25 @@ pub async fn lsp_virtual_document(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn lsp_can_download_sources(window: Window, state: State<'_, AppState>, uri: String) -> IdeResult<bool> {
+    ide_host::ops::lsp::lsp_can_download_sources(&state.host, window.label(), uri).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn lsp_library_sources(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    uri: String,
+    pos: Pos,
+    sources: Option<std::path::PathBuf>,
+) -> IdeResult<Option<Location>> {
+    ide_host::ops::lsp::lsp_library_sources(&state.host, window.label(), request, uri, pos, sources).await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn lsp_resolve_class_file(
     window: Window,
     state: State<'_, AppState>,
@@ -136,9 +171,13 @@ pub async fn lsp_resolve_class_file(
 
 /// References of the symbol at `pos`. `project_wide` also searches project files
 /// outside the language server's analysis scope; bulk scans over many symbols
-/// leave it off. Cancel with `cancel_request(request)`.
+/// leave it off. Java, `project_wide`: without `libraries`, the dependencies and the JDK
+/// are not searched; with it, those found in the sources arrive on `on_partial` before
+/// the slower search for the rest, and the result has them all. Cancel with
+/// `cancel_request(request)`.
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn lsp_references(
     window: Window,
     state: State<'_, AppState>,
@@ -147,7 +186,10 @@ pub async fn lsp_references(
     pos: Pos,
     include_declaration: bool,
     project_wide: bool,
+    libraries: bool,
+    on_partial: tauri::ipc::Channel<References>,
 ) -> IdeResult<References> {
+    let on_partial = super::sender(on_partial);
     ide_host::ops::lsp::lsp_references(
         &state.host,
         window.label(),
@@ -156,6 +198,8 @@ pub async fn lsp_references(
         pos,
         include_declaration,
         project_wide,
+        libraries,
+        on_partial,
     )
     .await
 }
@@ -291,6 +335,124 @@ pub async fn lsp_hierarchy_refactor(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn lsp_signature_info(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    pos: Pos,
+) -> IdeResult<MethodSignature> {
+    ide_host::ops::lsp::lsp_signature_info(&state.host, window.label(), request, doc, pos).await
+}
+
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn lsp_change_signature(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    pos: Pos,
+    signature: MethodSignature,
+    delegate: bool,
+    confirmation: Option<String>,
+) -> IdeResult<ServerRefactored> {
+    ide_host::ops::lsp::lsp_change_signature(
+        &state.host,
+        window.label(),
+        request,
+        doc,
+        pos,
+        signature,
+        delegate,
+        confirmation,
+    )
+    .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn lsp_java_move_destinations(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    kind: String,
+    args: String,
+) -> IdeResult<Vec<String>> {
+    ide_host::ops::lsp::lsp_java_move_destinations(&state.host, window.label(), request, doc, kind, args).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn lsp_java_source_types(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    project_name: Option<String>,
+) -> IdeResult<Vec<String>> {
+    ide_host::ops::lsp::lsp_java_source_types(&state.host, window.label(), request, doc, project_name).await
+}
+
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn lsp_java_move(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    kind: String,
+    args: String,
+    confirmation: Option<String>,
+) -> IdeResult<ServerRefactored> {
+    ide_host::ops::lsp::lsp_java_move(&state.host, window.label(), request, doc, kind, args, confirmation).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn lsp_extract_interface_info(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    pos: Pos,
+) -> IdeResult<ExtractInterfaceInfo> {
+    ide_host::ops::lsp::lsp_extract_interface_info(&state.host, window.label(), request, doc, pos).await
+}
+
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn lsp_extract_interface(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+    doc: DocId,
+    pos: Pos,
+    members: Vec<String>,
+    name: String,
+    destination: String,
+    confirmation: Option<String>,
+) -> IdeResult<ServerRefactored> {
+    ide_host::ops::lsp::lsp_extract_interface(
+        &state.host,
+        window.label(),
+        request,
+        doc,
+        pos,
+        members,
+        name,
+        destination,
+        confirmation,
+    )
+    .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn lsp_format(
     window: Window,
     state: State<'_, AppState>,
@@ -354,6 +516,17 @@ pub async fn lsp_call_hierarchy(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn lsp_prepare_type_hierarchy(
+    window: Window,
+    state: State<'_, AppState>,
+    doc: DocId,
+    pos: Pos,
+) -> IdeResult<Option<HierarchyItem>> {
+    ide_host::ops::lsp::lsp_prepare_type_hierarchy(&state.host, window.label(), doc, pos).await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn lsp_type_hierarchy(
     window: Window,
     state: State<'_, AppState>,
@@ -381,6 +554,13 @@ pub fn lsp_resend_diagnostics(window: Window, state: State<'_, AppState>) -> Ide
 #[specta::specta]
 pub async fn lsp_restart(window: Window, state: State<'_, AppState>, server: ServerId) -> IdeResult<()> {
     ide_host::ops::lsp::lsp_restart(&state.host, window.label(), server).await
+}
+
+/// Restarts the language servers named `name` in every open project (after a tool update).
+#[tauri::command]
+#[specta::specta]
+pub async fn lsp_restart_named(state: State<'_, AppState>, name: String) -> IdeResult<()> {
+    ide_host::ops::lsp::lsp_restart_named(&state.host, &name).await
 }
 
 /// Applies a (previewed) workspace edit, e.g. after rename confirmation.
@@ -450,4 +630,30 @@ pub async fn lsp_execute_code_action(
     answers: Vec<FormAnswer>,
 ) -> IdeResult<Vec<ide_core::IpcPath>> {
     ide_host::ops::lsp::lsp_execute_code_action(&state.host, window.label(), request, doc, action, answers).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_language_visuals(
+    window: Window,
+    state: State<'_, AppState>,
+    doc: DocId,
+) -> IdeResult<ide_host::ops::lsp::PluginLanguageVisuals> {
+    ide_host::ops::lsp::plugin_language_visuals(&state.host, window.label(), doc).await
+}
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_color_presentations(
+    window: Window,
+    state: State<'_, AppState>,
+    doc: DocId,
+    plugin: String,
+    color: ide_plugin::language_features::ColorInfo,
+) -> IdeResult<Vec<String>> {
+    ide_host::ops::lsp::plugin_color_presentations(&state.host, window.label(), doc, plugin, color).await
+}
+#[tauri::command]
+#[specta::specta]
+pub fn plugin_formatters() -> IdeResult<Vec<ide_host::plugins::language_features::FormatterChoice>> {
+    Ok(ide_host::ops::lsp::plugin_formatters())
 }

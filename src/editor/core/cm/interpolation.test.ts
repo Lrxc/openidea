@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { EditorState } from "@codemirror/state";
-import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import { getIndentation, indentUnit } from "@codemirror/language";
+import { completedSyntaxTree } from "@/test/syntax";
 import { classHighlighter, highlightTree } from "@lezer/highlight";
 import { findLanguageDescription, loadSupport, loadedSupport } from "./languages";
 
@@ -9,9 +10,8 @@ async function tokens(mode: string, source: string) {
   const support = await loadSupport(desc);
   expect(loadedSupport(desc)).toBe(support);
   const state = EditorState.create({ doc: source, extensions: [support!] });
-  ensureSyntaxTree(state, source.length, 1000);
   const result: { text: string; style: string; from: number; to: number }[] = [];
-  highlightTree(syntaxTree(state), classHighlighter, (from, to, style) =>
+  highlightTree(completedSyntaxTree(state), classHighlighter, (from, to, style) =>
     result.push({ text: source.slice(from, to), style, from, to }),
   );
   return result;
@@ -81,6 +81,23 @@ describe("frontend string interpolation", () => {
     expect(out.some((t) => t.text === "}}" && !t.style.includes("string"))).toBe(true);
     expect(out.some((t) => t.text.includes("{brace}") && t.style === "tok-string")).toBe(true);
   });
+
+  it.each(["Kotlin", "Scala", "Dart", "Groovy", "C#"])(
+    "%s indents brackets opened after a string from the line's indentation",
+    async (mode) => {
+      const support = await loadSupport(findLanguageDescription(mode, "")!);
+      const doc = 'f(\n    pair("a", g(\n        x\n    )),\n)';
+      const state = EditorState.create({
+        doc,
+        extensions: [support!, indentUnit.of("    "), EditorState.tabSize.of(4)],
+      });
+      completedSyntaxTree(state);
+      const indent = (line: number) => getIndentation(state, state.doc.line(line).from);
+      expect(indent(3)).toBe(8);
+      // C#'s mode leaves a closing bracket's indentation to the editor.
+      if (mode !== "C#") expect(indent(4)).toBe(4);
+    },
+  );
 
   it("keeps Groovy dotted interpolation in code", async () => {
     const out = await tokens("Groovy", '"$person.name tail"');

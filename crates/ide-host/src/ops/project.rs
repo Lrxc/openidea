@@ -13,6 +13,8 @@ pub struct ProjectInfo {
     pub trusted: bool,
     pub root: ide_core::IpcPath,
     pub name: String,
+    #[serde(default)]
+    pub display_name: String,
     pub is_git: bool,
     pub settings: Settings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -24,17 +26,23 @@ pub struct ProjectInfo {
 pub fn info(project: &Project) -> ProjectInfo {
     let settings = project.settings.effective();
     let custom = settings.general.project_name.trim();
+    let primary = if custom.is_empty() {
+        project.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    } else {
+        custom.to_owned()
+    };
+    let workspace = ide_workspace::workspace::Workspace::load(&project.root).ok().flatten();
     ProjectInfo {
         trusted: project.is_trusted(),
-        name: if custom.is_empty() {
-            project.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-        } else {
-            custom.to_owned()
-        },
+        display_name: workspace
+            .as_ref()
+            .map(|w| w.display_name(&project.root, &primary))
+            .unwrap_or_else(|| primary.clone()),
+        name: workspace.as_ref().filter(|w| w.is_container(&project.root)).map(|w| w.name.clone()).unwrap_or(primary),
         is_git: !project.repos.read().is_empty(),
         settings,
         root: project.root.clone().into(),
-        workspace: ide_workspace::workspace::Workspace::load(&project.root).ok().flatten(),
+        workspace,
         unity: ide_workspace::unity::detect(&project.root),
     }
 }
@@ -57,44 +65,86 @@ pub fn settings(host: &Host, window: &str) -> Settings {
     })
 }
 
+/// The removed built-in theme a settings file of this window still names, if any
+/// (`settings` reports its stand-in): the "provided by a plugin now" notice targets these.
+pub fn settings_removed_theme(host: &Host, window: &str) -> Option<String> {
+    match host.project(window) {
+        Ok(p) => p.settings.named_removed_theme().or_else(|| host.global_settings.named_removed_theme()),
+        Err(_) => host.global_settings.named_removed_theme(),
+    }
+}
+
 pub fn roots(host: &Host, window: &str) -> IdeResult<ide_workspace::ProjectRoots> {
     Ok(host.project(window)?.roots())
 }
 
 pub fn save_workspace(host: &Host, window: &str, name: &str, paths: Vec<std::path::PathBuf>) -> IdeResult<ProjectInfo> {
     let project = host.project(window)?;
-    ide_workspace::workspace::Workspace::save(&project.root, name, paths, false)?;
+    let previous = ide_workspace::workspace::Workspace::load(&project.root)?
+        .ok_or_else(|| ide_core::IdeError::invalid("This folder is not a workspace"))?;
+    for path in paths.iter().filter(|p| !previous.projects.contains(p)) {
+        require_attachment_trust(host, path)?;
+    }
+    if !previous.is_container(&project.root) && paths.first() != Some(&project.root) {
+        return Err(ide_core::IdeError::invalid("The primary project cannot be detached"));
+    }
+    if !previous.is_container(&project.root) && paths == [project.root.clone()] {
+        std::fs::remove_file(project.root.join(ide_workspace::workspace::FILE))?;
+    } else {
+        let workspace = ide_workspace::workspace::Workspace::save(&project.root, name, paths, false)?;
+        keep_attachment_private(&project.root, &workspace)?;
+    }
+    refresh_workspace(&project);
+    Ok(info(&project))
+}
+
+fn require_attachment_trust(host: &Host, path: &Path) -> IdeResult<()> {
+    if !host.trust.trusted(path)? {
+        return Err(ide_core::IdeError::invalid("Trust the project before attaching it"));
+    }
+    Ok(())
+}
+
+fn keep_attachment_private(root: &Path, workspace: &ide_workspace::workspace::Workspace) -> IdeResult<()> {
+    if !workspace.is_container(root) {
+        ide_vcs::changelists::ensure_ignored(&root.join(".openidea"), &["/workspace.json"])?;
+    }
+    Ok(())
+}
+
+fn refresh_workspace(project: &Project) {
     project.settings.reload();
     project.refresh_index_scope();
     project.refresh_repositories();
     project.sink.emit(ide_core::IdeEvent::ProjectRootsChanged { root: project.root.clone().into() });
-    Ok(info(&project))
 }
 
-/// Links a folder, or prepares an automatic workspace for the caller to open in place.
+/// Attaches a trusted folder without replacing the current project.
 pub fn attach_workspace(host: &Host, window: &str, path: &Path) -> IdeResult<ide_core::IpcPath> {
     let project = host.project(window)?;
     let path = dunce::canonicalize(path)?;
     if project.light {
         return Err(ide_core::IdeError::invalid("Open a project before attaching a folder"));
     }
+    if path == project.root {
+        return Ok(project.root.clone().into());
+    }
+    require_attachment_trust(host, &path)?;
     if let Some(mut workspace) = ide_workspace::workspace::Workspace::load(&project.root)? {
         if !workspace.projects.contains(&path) {
             workspace.projects.push(path);
             save_workspace(host, window, &workspace.name, workspace.projects)?;
         }
-        return Ok(project.root.clone().into());
+    } else {
+        let workspace = ide_workspace::workspace::Workspace::attach(
+            &project.root,
+            &info(&project).name,
+            vec![project.root.clone(), path],
+        )?;
+        keep_attachment_private(&project.root, &workspace)?;
+        refresh_workspace(&project);
     }
-    if path == project.root {
-        return Ok(project.root.clone().into());
-    }
-    Ok(ide_workspace::workspace::Workspace::create_for_project(
-        &host.data_dir,
-        &project.root,
-        &info(&project).name,
-        &path,
-    )?
-    .into())
+    Ok(project.root.clone().into())
 }
 
 /// What [`set_settings`] changed; the caller tells the windows.
@@ -123,10 +173,21 @@ pub fn set_settings(
     // A LightEdit window has no project layer: its values are global.
     let project_scope = matches!(scope, SettingsScope::Project) && current.as_ref().is_some_and(|p| !p.light);
     let is_proxy = key == "proxy" || key.starts_with("proxy.");
-    let Some(value) = host.take_proxy_password(key, value)? else {
+    let Some(mut value) = host.take_proxy_password(key, value)? else {
         host.apply_proxy();
         return Ok(SettingsApplied { settings: settings(host, window), project_scope, roots_changed: None });
     };
+    // One canonical spelling per linked POM, including a project outside the opened root.
+    if project_scope
+        && key == "languages.java.maven.linkedProjects"
+        && let Some(project) = current.as_ref()
+        && let Some(list) = value.as_array()
+    {
+        let poms: Vec<String> = list.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect();
+        if poms.len() == list.len() {
+            value = serde_json::json!(ide_build::maven::normalize_linked_poms(&project.root, &poms));
+        }
+    }
     let settings = match &current {
         Some(p) if project_scope => p.settings.set(scope, key, value)?,
         Some(p) => {
@@ -171,6 +232,9 @@ pub fn set_settings(
     if key == "ssh" || key.starts_with("ssh.") {
         host.ssh.set_configs(host.global_settings.effective().ssh.configs);
     }
+    if key == "languages" || key == "languages.java" || key.starts_with("languages.java.addedJdks") {
+        host.apply_added_jdks();
+    }
     if is_proxy {
         host.apply_proxy();
     }
@@ -180,10 +244,19 @@ pub fn set_settings(
         || key == "editor.codeStyle"
         || key.starts_with("editor.codeStyle.")
         || key == "inspections"
-        || key.starts_with("inspections.");
+        || key.starts_with("inspections.")
+        || key == "files"
+        || key == "files.composeFileOverrides"
+        || key.starts_with("files.composeFileOverrides.");
     let toolchain = ["languages", "tools", "languageServers", "projectStructure"]
         .iter()
         .any(|k| key == *k || key.starts_with(&format!("{k}.")));
+    // A run target chosen as the Python interpreter (or changed) needs a snapshot of its libraries.
+    if ["languages", "languages.python", "languages.python.interpreter", "runTargets"].contains(&key) {
+        for project in affected() {
+            crate::ops::sdk::container_python::ensure(host, &project);
+        }
+    }
     // Code style only reaches servers as settings (e.g. jdtls' formatter profile); builds don't depend on it.
     if code_style || toolchain {
         for project in affected() {
