@@ -22,6 +22,7 @@ import type {
 } from "@/bindings";
 import { useChangesOptions } from "./changesOptions";
 import { clearAgentTaskFontZoom, resetAllAgentFontZoom } from "./fontZoom";
+import { clearDismissedAssets } from "./sessionAssetsModel";
 import { basename, useProject } from "@/platform/project";
 import { defaultTaskProject } from "./project";
 import { call, commands, isTauri } from "@/platform/ipc";
@@ -613,6 +614,7 @@ function onEvent(e: AgentEvent) {
         ...(s.docked === e.id ? { docked: null } : {}),
       });
       clearAgentTaskFontZoom(sessionKey(e.id));
+      clearDismissedAssets(e.id);
       void editorService().closeInput?.(sessionKey(e.id));
       break;
     }
@@ -1350,6 +1352,8 @@ export const stopBackgroundTask = (task: string, background: string) =>
   call(commands.agentStopBackground(task, background));
 export const respond = (task: string, permission: number, option: string | null) =>
   call(commands.agentRespond(task, permission, option));
+export const answerQuestion = (task: string, question: string, answer: string | null) =>
+  call(commands.agentAnswerQuestion(task, question, answer));
 export const unarchiveTask = (task: string) => call(commands.agentUnarchive(task));
 export const renameTask = (task: string, title: string) => call(commands.agentRename(task, title));
 export const archiveTask = (task: string) => call(commands.agentArchive(task));

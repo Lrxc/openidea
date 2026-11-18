@@ -25,6 +25,7 @@ mod kotlin_lsp;
 mod launch;
 mod library_source;
 mod loading;
+mod message_requests;
 mod notebook;
 mod phoxite;
 mod plugin_requests;
@@ -48,6 +49,7 @@ pub use jdtls::jvm_inspect::JdtJvmInspector;
 pub use jdtls::stream_trace::JdtStreamTracer;
 pub use kotlin_lsp::{KotlinDebugServer, KotlinDebugUnavailable};
 pub use launch::{LaunchError, Launcher, ProcessLauncher};
+pub use message_requests::answer as answer_message_request;
 pub use notebook::{NotebookCell, NotebookCellDoc, cell_uri};
 pub use plugin_requests::plugin_method_allowed;
 pub use scope::{CandidateFiles, CandidateFn, CandidateQuery, MAX_CANDIDATES};
@@ -833,6 +835,9 @@ impl LspManager {
         // The settings hook may touch the filesystem (e.g. scanning for JDKs); TCP
         // servers may take a while to start listening.
         let launched = tokio::task::spawn_blocking(move || {
+            // The project's direnv environment (a Nix devshell) may hold the server and its
+            // toolchain: start once it has loaded.
+            ide_core::project_env::wait(&tail.root, &launch_cancel);
             if !me.execution_allowed.load(Ordering::Acquire) {
                 return Err(LaunchError::Config("Project is in Restricted Mode".into()));
             }
@@ -1811,9 +1816,16 @@ impl LspManager {
                 out.push(loc);
                 continue;
             };
-            let Ok(uri) = self.java_class_file(Path::new(""), Some((entry.jar, entry.entry))).await else {
-                out.push(loc);
-                continue;
+            // The Kotlin server may name the jar by another path than jdtls (its own copy of a
+            // `system`-scope jar): its stub would be all the user gets, so take jdtls' only class
+            // of that name.
+            let uri = match self.archive_class(entry.jar, entry.entry, true).await {
+                Ok(uri) => uri,
+                Err(e) => {
+                    tracing::info!("library class stays a stub: {}", e.message);
+                    out.push(loc);
+                    continue;
+                }
             };
             let range = match (&name, self.virtual_document(&uri).await) {
                 (Some(name), Ok(doc)) => library_source::declaration_range(&doc.text, name),
@@ -3232,6 +3244,7 @@ impl LspManager {
             .call(t, "textDocument/prepareCallHierarchy", snap.pos_params(t, pos), Some(cancel), DEFAULT_TIMEOUT)
             .await?;
         let items = items.filter(|i| !i.is_empty()).ok_or_else(no_hierarchy_target)?;
+        let root = convert::call_item(&self.conv(t.enc()), &items[0], Vec::new());
         let query = || async {
             let mut out = Vec::new();
             for item in &items {
@@ -3254,7 +3267,10 @@ impl LspManager {
                         let (src, _) = uri_target(item.uri.as_str());
                         for c in calls.unwrap_or_default() {
                             let ranges = c.from_ranges.iter().map(|r| conv.range(&src, *r)).collect();
-                            out.extend(convert::call_item(&conv, &c.to, ranges));
+                            out.extend(
+                                convert::call_item(&conv, &c.to, ranges)
+                                    .map(|to| HierarchyItem { from_path: Some(src.clone().into()), ..to }),
+                            );
                         }
                     }
                 }
@@ -3284,8 +3300,8 @@ impl LspManager {
         if cancel.is_cancelled() {
             return Err(IdeError::cancelled());
         }
-        self.note_virtual(&t.server, out.iter().map(|i| i.uri.as_deref()));
-        Ok(CallHierarchy { items: out, incomplete })
+        self.note_virtual(&t.server, out.iter().chain(&root).map(|i| i.uri.as_deref()));
+        Ok(CallHierarchy { root, items: out, incomplete })
     }
 
     /// The type at `pos` as the server's type hierarchy names it (with its `detail`, the

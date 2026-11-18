@@ -8,6 +8,7 @@
 //! next prompt when the agent supports `session/load`.
 
 mod acp;
+mod async_questions;
 mod catalogs;
 mod config;
 mod conversation;
@@ -222,11 +223,24 @@ impl Shared {
             if builtin_off { Vec::new() } else { mcp_servers_for(init.mcp_stdio(), &self.paths.project_root) };
         let configured = self.mcp_servers_hook.read().as_ref().map(|hook| hook()).unwrap_or_default();
         servers.extend(mcp::acp_mcp_servers(&configured, provider, init, overrides));
-        let mut off = mcp::servers_off(&configured, overrides);
-        if builtin_off {
-            off.push(BUILTIN_SERVER.to_owned());
-        }
+        let off = Self::mcp_off(&configured, provider, overrides);
         McpForSession { servers, off }
+    }
+
+    fn mcp_servers_off_for_session(&self, provider: &str, overrides: &BTreeMap<String, bool>) -> Vec<String> {
+        let configured = self.mcp_servers_hook.read().as_ref().map(|hook| hook()).unwrap_or_default();
+        Self::mcp_off(&configured, provider, overrides)
+    }
+
+    fn mcp_off(configured: &[McpServer], provider: &str, overrides: &BTreeMap<String, bool>) -> Vec<String> {
+        let mut off = mcp::servers_off(configured, provider, overrides);
+        if overrides.get(mcp::BUILTIN_MCP_NAME) == Some(&false) {
+            off.push(BUILTIN_SERVER.to_owned());
+            off.push(mcp::BUILTIN_MCP_NAME.to_owned());
+            off.sort();
+            off.dedup();
+        }
+        off
     }
 
     fn known_config(&self, provider: &str) -> Vec<AgentConfigOption> {
@@ -402,11 +416,15 @@ struct Task {
     live: Mutex<Option<Live>>,
     /// Serializes starting the agent.
     connecting: tokio::sync::Mutex<()>,
+    /// Serializes replies from multiple windows to the same async question.
+    answering_questions: tokio::sync::Mutex<()>,
     /// Unanswered permission requests: where to send the chosen option id.
     permissions: Mutex<HashMap<u32, std::sync::mpsc::Sender<Option<String>>>>,
     next_permission: AtomicU32,
     /// Set while `session/load` replays history we already have.
     replaying: AtomicBool,
+    /// The saved session failed to load and the user was told: the next start opens a new one.
+    start_fresh: AtomicBool,
     /// The current turn is being cancelled to send the first queued message right away.
     send_now: AtomicBool,
     /// The user stopped the current turn. A stop that reaches the agent before it took the
@@ -922,29 +940,50 @@ impl AgentManager {
         Ok(item)
     }
 
-    /// Sends queued message `queued` next, cancelling the current turn if there is one.
-    pub fn send_queued_now(&self, id: &str, queued: &str) -> IdeResult<()> {
+    /// Sends queued message `queued` now: into the running turn when the agent takes
+    /// messages mid-turn, else next, cancelling the current turn if there is one.
+    pub async fn send_queued_now(&self, id: &str, queued: &str) -> IdeResult<()> {
         let task = self.task(id)?;
-        let idle = {
+        let (item, busy) = {
             let mut s = task.state.lock();
             let i =
                 s.task.queue.iter().position(|q| q.id == queued).ok_or_else(|| IdeError::not_found("already sent"))?;
             let item = s.task.queue.remove(i);
-            if s.busy {
-                s.task.queue.insert(0, item);
-                None
-            } else {
+            let busy = s.busy;
+            if !busy {
                 s.busy = true;
-                Some(item)
             }
+            (item, busy)
         };
         task.persist();
         task.emit_task();
-        match idle {
-            Some(item) => {
-                self.shared.runtime.spawn(async move { task.run(item.prompt).await });
+        if !busy {
+            self.shared.runtime.spawn(async move { task.run(item.prompt).await });
+            return Ok(());
+        }
+        // Out of the queue while it is steered, so the turn ending meanwhile doesn't send it twice.
+        let prompt = match task.steer(item.prompt).await {
+            Ok(()) => return Ok(()),
+            Err(prompt) => prompt,
+        };
+        let start = {
+            let mut s = task.state.lock();
+            if s.busy {
+                s.task.queue.insert(0, AgentQueued { id: item.id, prompt });
+                None
+            } else {
+                // The turn ended while steering was tried: nothing is left to interrupt.
+                s.busy = true;
+                Some(prompt)
+            }
+        };
+        match start {
+            Some(prompt) => {
+                self.shared.runtime.spawn(async move { task.run(prompt).await });
             }
             None => {
+                task.persist();
+                task.emit_task();
                 task.send_now.store(true, Ordering::Release);
                 task.cancel();
             }
@@ -1375,6 +1414,53 @@ impl AgentManager {
         }
     }
 
+    /// Replies to a non-blocking question without interrupting the agent's current turn.
+    pub async fn answer_question(&self, id: &str, question: &str, answer: Option<String>) -> IdeResult<()> {
+        let task = self.task(id)?;
+        let _answering = task.answering_questions.lock().await;
+        let questions = {
+            let s = task.state.lock();
+            s.conversation
+                .main
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentEntry::Question { id, questions, chosen: None, .. } if id == question => {
+                        Some(questions.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| IdeError::not_found("the question was already answered"))?
+        };
+        let chosen = match answer {
+            None => "Skipped".to_owned(),
+            Some(answer) => {
+                let (text, record) = async_questions::reply(&questions, &answer)?;
+                let prompt = AgentPrompt { text, files: Vec::new(), images: Vec::new() };
+                if let Err(prompt) = task.steer(prompt).await {
+                    if task.state.lock().busy {
+                        return Err(IdeError::unavailable("the reply could not join the running turn; try again"));
+                    }
+                    self.prompt(id, prompt, false).await?;
+                }
+                record
+            }
+        };
+        let changed = {
+            let mut s = task.state.lock();
+            s.conversation.main.entries.iter_mut().enumerate().find_map(|(index, entry)| match entry {
+                AgentEntry::Question { id, chosen: current, .. } if id == question => {
+                    *current = Some(chosen.clone());
+                    Some((None, index))
+                }
+                _ => None,
+            })
+        };
+        task.mark_dirty(changed);
+        task.persist();
+        Ok(())
+    }
+
     /// Stops the agent and moves the task to Archived; its worktree stays.
     pub fn archive(&self, id: &str) -> IdeResult<()> {
         let task = self.task(id)?;
@@ -1618,6 +1704,26 @@ impl AgentManager {
         Ok(out)
     }
 
+    /// Recycles idle resumable live sessions (or schedules reload after the running turn) when
+    /// global, workspace, or built-in IDE MCP server settings change.
+    pub fn notify_mcp_servers_changed(&self) {
+        let tasks: Vec<Arc<Task>> = self.tasks.read().values().cloned().collect();
+        for task in tasks {
+            let (archived, busy, has_bg) = {
+                let s = task.state.lock();
+                (s.task.status == AgentStatus::Archived, s.busy, !s.background_tasks.is_empty())
+            };
+            if archived {
+                continue;
+            }
+            if busy || has_bg || !task.permissions.lock().is_empty() {
+                task.mcp_reload_pending.store(true, Ordering::Release);
+            } else {
+                task.recycle_resumable_session();
+            }
+        }
+    }
+
     /// Stops every agent (project closed).
     pub fn shutdown(&self) {
         for task in self.tasks.read().values() {
@@ -1653,9 +1759,11 @@ impl Task {
             }),
             live: Mutex::new(None),
             connecting: tokio::sync::Mutex::new(()),
+            answering_questions: tokio::sync::Mutex::new(()),
             permissions: Mutex::new(HashMap::new()),
             next_permission: AtomicU32::new(1),
             replaying: AtomicBool::new(false),
+            start_fresh: AtomicBool::new(false),
             send_now: AtomicBool::new(false),
             cancel_pending: AtomicBool::new(false),
             turn_started: AtomicBool::new(false),
@@ -2218,9 +2326,16 @@ impl Task {
         saved: Option<String>,
     ) -> Result<Live, SessionOpenError> {
         let launch_cwd = cwd.to_path_buf();
-        let spec = tokio::task::spawn_blocking(move || spec.resolve_for_launch(&launch_cwd))
+        let mut spec = tokio::task::spawn_blocking(move || spec.resolve_for_launch(&launch_cwd))
             .await
             .map_err(|e| SessionOpenError { message: e.to_string(), allow_acp_fallback: false })?;
+        if spec.driver == provider::Driver::Acp && provider::is_copilot_provider(provider_id) {
+            let mcp_overrides = self.state.lock().task.mcp_overrides.clone();
+            for name in self.shared.mcp_servers_off_for_session(provider_id, &mcp_overrides) {
+                spec.args.push("--disable-mcp-server".into());
+                spec.args.push(name);
+            }
+        }
         self.stderr.lock().clear();
         self.config_sent.lock().clear();
         let weak = Arc::downgrade(self);
@@ -2257,7 +2372,8 @@ impl Task {
 
         let mut tried_auth = false;
         let mut session = None;
-        if let (Some(id), true) = (saved, can_load) {
+        let start_fresh = self.start_fresh.load(Ordering::Acquire);
+        if let (Some(id), true, false) = (saved, can_load, start_fresh) {
             self.replaying.store(true, Ordering::Release);
             let mut params = session_params(&cwd_s, &mcp_servers);
             params["sessionId"] = json!(&id);
@@ -2266,7 +2382,23 @@ impl Task {
             self.replaying.store(false, Ordering::Release);
             match loaded {
                 Ok(v) => session = Some((id, v)),
-                Err(e) => tracing::info!("agent task {}: session/load failed, starting a new session: {e}", self.id),
+                // Not silently: a new session would lose the conversation and replace the saved id.
+                Err(e) => {
+                    tracing::info!("agent task {}: session/load failed: {e}", self.id);
+                    if let Some(message) = self.sign_in_error(&e, Some(&sign_in_message)) {
+                        return Err(SessionOpenError { message, allow_acp_fallback: false });
+                    }
+                    self.start_fresh.store(true, Ordering::Release);
+                    return Err(SessionOpenError {
+                        message: format!(
+                            "Couldn't reopen this conversation's {} session: {}\n\nSend the message again to \
+                             continue in a new session. The agent won't see the earlier conversation.",
+                            spec.name,
+                            self.describe(e)
+                        ),
+                        allow_acp_fallback: false,
+                    });
+                }
             }
         }
         let resumed = session.is_some();
@@ -2371,6 +2503,7 @@ impl Task {
             s.task.config = options;
             s.task.capabilities = capabilities;
             s.session_id = Some(session_id.clone());
+            self.start_fresh.store(false, Ordering::Release);
             // The (re)started process runs nothing yet: whatever it reports next is all of it.
             s.background_tasks = Vec::new();
             s.task.background.clear();
@@ -2594,7 +2727,7 @@ impl Task {
         let applied = self.state.lock().conversation.apply(session, update, now_ms());
         self.mark_dirty(applied);
         // A subagent can start or finish after the turn that started it: saved right away.
-        if kind == "subagent_update" {
+        if matches!(kind, "subagent_update" | "user_question") {
             self.persist();
         }
     }
@@ -2981,7 +3114,7 @@ fn blocks(prompt: &AgentPrompt, contents: &[Option<String>]) -> Vec<Value> {
         });
     }
     for i in &prompt.images {
-        out.push(json!({ "type": "image", "mimeType": i.mime_type, "data": i.data }));
+        out.push(json!({ "type": "image", "mimeType": i.media_type(), "data": i.data }));
     }
     out
 }
