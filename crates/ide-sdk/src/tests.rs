@@ -888,6 +888,28 @@ fn maven_options_carry_active_profiles_into_the_command_line() {
 }
 
 #[test]
+fn always_update_snapshots_adds_dash_u_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Settings::default();
+    s.languages.java.maven.update_snapshots = true;
+    assert_eq!(maven_options(tmp.path(), &s), ["-U"]);
+    let mut configs = vec![run("maven", "./mvnw", &["package"])];
+    for _ in 0..2 {
+        apply_to_run_configs(&mut configs, tmp.path(), &s);
+        assert_eq!(configs[0].args, ["-U", "package"]);
+    }
+    let mut own = vec![run("maven", "./mvnw", &["--update-snapshots", "package"])];
+    apply_to_run_configs(&mut own, tmp.path(), &s);
+    assert_eq!(own[0].args, ["--update-snapshots", "package"]);
+
+    // Settings apply to the stored configuration at each launch, so turning it off drops -U.
+    s.languages.java.maven.update_snapshots = false;
+    let mut stored = vec![run("maven", "./mvnw", &["package"])];
+    apply_to_run_configs(&mut stored, tmp.path(), &s);
+    assert_eq!(stored[0].args, ["package"]);
+}
+
+#[test]
 fn maven_profile_and_toolchain_overrides_accept_every_option_form() {
     let tmp = tempfile::tempdir().unwrap();
     let mut s = Settings::default();
@@ -1853,11 +1875,40 @@ fn go_modules_skip_the_main_module_and_missing_downloads() {
 {"Path":"golang.org/x/text","Version":"v0.14.0","Dir":"/gopath/pkg/mod/golang.org/x/text@v0.14.0"}
 {"Path":"example.com/missing","Version":"v1.0.0","Error":{"Err":"module lookup disabled"}}"#;
     assert_eq!(
-        crate::libraries::parse_go_modules(out),
+        crate::libraries::parse_go_modules(out, std::path::Path::new("/p")),
         [(
             "golang.org/x/text@v0.14.0".to_owned(),
             std::path::PathBuf::from("/gopath/pkg/mod/golang.org/x/text@v0.14.0")
         )]
+    );
+}
+
+#[test]
+fn go_modules_skip_module_sources_inside_the_project() {
+    let out = r#"{"Path":"example.com/app","Main":true,"Dir":"/p/app"}
+{"Path":"example.com/local","Version":"v0.0.0","Dir":"/p/local"}
+{"Path":"example.com/vendored","Version":"v0.0.0","Dir":"/p/vendor/vendored"}
+{"Path":"example.com/outside","Version":"v1.0.0","Dir":"/other/outside"}
+{"Path":"golang.org/x/text","Version":"v0.14.0","Dir":"/gopath/pkg/mod/golang.org/x/text@v0.14.0"}"#;
+    assert_eq!(
+        crate::libraries::parse_go_modules(out, std::path::Path::new("/p")),
+        [
+            ("example.com/vendored@v0.0.0".to_owned(), std::path::PathBuf::from("/p/vendor/vendored")),
+            ("example.com/outside@v1.0.0".to_owned(), std::path::PathBuf::from("/other/outside")),
+            (
+                "golang.org/x/text@v0.14.0".to_owned(),
+                std::path::PathBuf::from("/gopath/pkg/mod/golang.org/x/text@v0.14.0")
+            ),
+        ]
+    );
+    // Opened from a root that does not contain it: the same folder is a library again.
+    assert!(
+        crate::libraries::parse_go_modules(
+            r#"{"Path":"example.com/local","Version":"v0.0.0","Dir":"/p/local"}"#,
+            std::path::Path::new("/p/app")
+        )
+        .iter()
+        .any(|(name, _)| name == "example.com/local@v0.0.0")
     );
 }
 
