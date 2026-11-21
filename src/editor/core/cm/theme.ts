@@ -276,14 +276,23 @@ export const openideaTheme = EditorView.theme({
   },
   ".cm-openidea-laneDeleted": {
     position: "absolute",
-    left: "0",
-    top: "-3px",
+    left: "-4px",
+    top: "-6px",
+    width: "12px",
+    height: "12px",
+    cursor: "pointer",
+    zIndex: "1",
+  },
+  ".cm-openidea-laneDeleted::after": {
+    content: '""',
+    position: "absolute",
+    left: "4px",
+    top: "3px",
     width: "0",
     height: "0",
     borderTop: "3px solid transparent",
     borderBottom: "3px solid transparent",
     borderLeft: "6px solid var(--lane-color)",
-    zIndex: "1",
   },
   ".cm-foldGutter": { width: "16px" },
   ".cm-foldGutter .cm-gutterElement": {
@@ -294,9 +303,9 @@ export const openideaTheme = EditorView.theme({
     cursor: "pointer",
     transition: "opacity var(--dur-fast) var(--ease)",
   },
-  ".cm-foldGutter .cm-openidea-foldOpen": { opacity: "0", display: "inline-flex" },
-  ".cm-foldGutter .cm-openidea-foldClosed": { display: "inline-flex" },
-  ".cm-gutters:hover .cm-foldGutter .cm-openidea-foldOpen": { opacity: "1" },
+  ".cm-foldGutter .cm-openidea-foldOpen, .cm-foldGutter .cm-openidea-foldClosed": { display: "inline-flex" },
+  ".cm-foldGutter .cm-openidea-foldOnHover": { opacity: "0" },
+  ".cm-gutters:hover .cm-foldGutter .cm-openidea-foldOnHover": { opacity: "1" },
   ".cm-foldGutter .cm-gutterElement:hover": { color: "var(--fg-secondary)" },
   ".cm-foldPlaceholder": {
     backgroundColor: "var(--editor-fold-chip)",
@@ -367,6 +376,11 @@ export const openideaTheme = EditorView.theme({
     borderRadius: "var(--radius-popup)",
     boxShadow: "var(--shadow-popup)",
   },
+  // Near the window edge CodeMirror caps the hover host's height; its sections then shrink and
+  // scroll inside the popup instead of running past its border. Content tooltips still carry
+  // their own `max-height` + `overflow` for the space they get when not squeezed.
+  ".cm-tooltip.cm-tooltip-hover": { display: "flex", flexDirection: "column" },
+  ".cm-tooltip-hover > .cm-tooltip-section": { minHeight: 0, flexShrink: 1 },
   ".cm-tooltip .cm-tooltip-arrow:before": {
     borderTopColor: "var(--border-popup)",
     borderBottomColor: "var(--border-popup)",

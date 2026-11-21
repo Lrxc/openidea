@@ -34,6 +34,12 @@
   align-items: center;
   gap: var(--space-1-5);
 }
+.inlineChoices {
+  flex-wrap: wrap;
+  min-height: var(--h-field);
+  max-width: 100%;
+  gap: var(--space-1) var(--space-4);
+}
 .inlineLabel::after {
   content: ":";
 }
@@ -42,6 +48,26 @@
 }
 .inlineText {
   width: 180px;
+}
+.checkWithField {
+  align-items: flex-start;
+  gap: var(--space-1) var(--space-2);
+}
+.checkWithField > label {
+  min-width: 0;
+  min-height: var(--h-field);
+}
+.inlineField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 280px;
+  max-width: 100%;
+}
+.inlineFieldHint {
+  color: var(--fg-subtle);
+  font-size: var(--fs-small);
+  line-height: 1.4;
 }
 .suffix {
   color: var(--fg);
@@ -92,6 +118,24 @@
   flex-wrap: wrap;
   gap: var(--space-1) var(--space-4);
 }
+.stackedRadioBlock,
+.stackedRadios {
+  flex-direction: column;
+  align-items: flex-start;
+}
+.stackedRadioBlock {
+  margin-inline-end: 0;
+}
+.stackedRadios {
+  max-width: 100%;
+}
+.stackedRadios .radio {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.stackedRadioBlock .radioLabel + .stackedRadios {
+  padding-inline-start: calc(var(--space-4) + var(--space-1));
+}
 .radio {
   display: inline-flex;
   align-items: center;
@@ -118,6 +162,48 @@
 }
 .radio input:disabled {
   opacity: 0.5;
+}
+
+.gutterIconList {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-1);
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  background: var(--bg-field);
+  font-size: var(--fs-ui);
+}
+.gutterIconRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-inline: var(--space-2);
+  border-radius: var(--radius-selection);
+}
+.gutterIconRow:has(input:enabled):hover {
+  background: var(--bg-hover);
+}
+.gutterIconPreview {
+  display: grid;
+  flex: 0 0 16px;
+  place-items: center;
+}
+.gutterIconRow:has(input:disabled) .gutterIconPreview {
+  opacity: 0.5;
+}
+.gutterIconRow .gutterIconChoice {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--h-list-row);
+  padding-block: var(--space-0-5);
+  overflow-wrap: anywhere;
+}
+.gutterSwatch {
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-small);
+  background: var(--accent);
 }
 
 /* Font page */

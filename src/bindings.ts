@@ -33,11 +33,17 @@ export const commands = {
 "group" | 
 /**  What the last turn changed, against the checkout as that turn started. */
 "lastTurn" | null) => typedError<AgentChange[], IdeError>(__TAURI_INVOKE("agent_changes", { task, view })),
+	/**  Installs the exact version offered if the selected installation still matches. */
+	agentCliUpdate: (provider: string, offer: AgentCliOffer, request: RequestId) => typedError<AgentCliUpdateResult, IdeError>(__TAURI_INVOKE("agent_cli_update", { provider, offer, request })),
+	/**  Checks the selected installation without modifying it. */
+	agentCliUpdateCheck: (provider: string, request: RequestId) => typedError<AgentCliUpdateResult, IdeError>(__TAURI_INVOKE("agent_cli_update_check", { provider, request })),
 	/**
 	 *  Slash commands to complete for `provider` in `task`'s directory, or in the project
 	 *  before a task exists (skills and custom commands on disk included).
 	 */
 	agentCommands: (provider: string, task: string | null) => typedError<AgentCommand[], IdeError>(__TAURI_INVOKE("agent_commands", { provider, task })),
+	/**  Reads the running session's context categories without sending a prompt. */
+	agentContextUsage: (task: string) => typedError<AgentContextUsage, IdeError>(__TAURI_INVOKE("agent_context_usage", { task })),
 	agentCreate: (request: NewAgentTask) => typedError<AgentTask_Serialize, IdeError>(__TAURI_INVOKE("agent_create", { request })),
 	/**  Imports a JetBrains `acp.json` file's `agent_servers` entries as custom agents. */
 	agentCustomImport: (text: string) => typedError<AcpImportOutcome[], IdeError>(__TAURI_INVOKE("agent_custom_import", { text })),
@@ -137,18 +143,35 @@ export const commands = {
 	agentSetEnv: (id: string, env: { [key in string]: string }) => typedError<null, IdeError>(__TAURI_INVOKE("agent_set_env", { id, env })),
 	/**  Updates per-session MCP server enable/disable overrides on `task`. */
 	agentSetMcpOverrides: (task: string, overrides: { [key in string]: boolean }) => typedError<AgentTask_Serialize, IdeError>(__TAURI_INVOKE("agent_set_mcp_overrides", { task, overrides })),
+	/**  Updates per-session skill modes on `task`. */
+	agentSetSkillOverrides: (task: string, overrides: { [key in string]: AgentSkillMode }) => typedError<AgentTask_Serialize, IdeError>(__TAURI_INVOKE("agent_set_skill_overrides", { task, overrides })),
 	/**
 	 *  Runs a `!` line of the composer in the task's folder with the user's shell, without
 	 *  starting a turn; its output goes to the agent with the next message.
 	 */
 	agentShell: (task: string, command: string, request: RequestId) => typedError<null, IdeError>(__TAURI_INVOKE("agent_shell", { task, command, request })),
+	/**
+	 *  Every skill discovered in the project and the user's folders, with the mode a session
+	 *  of this project runs it with (without any session's own overrides).
+	 */
+	agentSkillsList: () => typedError<AgentSkillState[], IdeError>(__TAURI_INVOKE("agent_skills_list")),
+	/**
+	 *  Sets how `name` may run in `scope`, in the settings file of that scope, and returns the
+	 *  updated list. `SKILL.md` files are never touched; the default `auto` removes the entry.
+	 */
+	agentSkillsSetMode: (name: string, scope: McpScope, mode: AgentSkillMode) => typedError<AgentSkillState[], IdeError>(__TAURI_INVOKE("agent_skills_set_mode", { name, scope, mode })),
 	/**  Stops one of the task's background tasks. */
 	agentStopBackground: (task: string, background: string) => typedError<null, IdeError>(__TAURI_INVOKE("agent_stop_background", { task, background })),
-	/**  Streams the project's agent events to this window; returns every task. */
-	agentSubscribe: (onEvent: Channel<AgentEvent_Deserialize>) => typedError<AgentTask_Serialize[], IdeError>(__TAURI_INVOKE("agent_subscribe", { onEvent })),
+	/**
+	 *  Streams the project's agent events to `subscriber`, one of the project's windows (a remote
+	 *  host sees them all as one `window`); returns every task.
+	 */
+	agentSubscribe: (onEvent: Channel<AgentEvent_Deserialize>, subscriber: string) => typedError<AgentTask_Serialize[], IdeError>(__TAURI_INVOKE("agent_subscribe", { onEvent, subscriber })),
 	agentUnarchive: (task: string) => typedError<null, IdeError>(__TAURI_INVOKE("agent_unarchive", { task })),
 	/**  Drops a queued message and returns it (to edit it). */
 	agentUnqueue: (task: string, queued: string) => typedError<AgentQueued, IdeError>(__TAURI_INVOKE("agent_unqueue", { task, queued })),
+	/**  Stops the events of a window that closed. */
+	agentUnsubscribe: (subscriber: string) => typedError<null, IdeError>(__TAURI_INVOKE("agent_unsubscribe", { subscriber })),
 	/**  Locate Duplicates over the files of `scope`. */
 	analysisLocateDuplicates: (request: RequestId, scope: SearchScope, options: DuplicateOptions) => typedError<DuplicatesReport, IdeError>(__TAURI_INVOKE("analysis_locate_duplicates", { request, scope, options })),
 	/**  Devices `adb` knows about, online ones first. */
@@ -362,9 +385,9 @@ export const commands = {
 	/**  Completions for an expression typed in Evaluate (`line` / `column` 0-based, UTF-16). */
 	debugCompletions: (session: DebugSessionId, frameId: number | null, text: string, line: number, column: number) => typedError<DebugCompletion[], IdeError>(__TAURI_INVOKE("debug_completions", { session, frameId, text, line, column })),
 	debugDataBreakpointInfo: (session: DebugSessionId, container: number, name: string, frameId: number | null) => typedError<DataBreakpointInfo, IdeError>(__TAURI_INVOKE("debug_data_breakpoint_info", { session, container, name, frameId })),
-	debugEvaluate: (session: DebugSessionId, frameId: number | null, expression: string) => typedError<Variable, IdeError>(__TAURI_INVOKE("debug_evaluate", { session, frameId, expression })),
+	debugEvaluate: (session: DebugSessionId, frameId: number | null, expression: string) => typedError<Variable_Serialize, IdeError>(__TAURI_INVOKE("debug_evaluate", { session, frameId, expression })),
 	/**  Evaluate with an explicit DAP context: `repl`, `watch`, `hover` or `clipboard`. */
-	debugEvaluateIn: (session: DebugSessionId, frameId: number | null, expression: string, context: string | null) => typedError<Variable, IdeError>(__TAURI_INVOKE("debug_evaluate_in", { session, frameId, expression, context })),
+	debugEvaluateIn: (session: DebugSessionId, frameId: number | null, expression: string, context: string | null) => typedError<Variable_Serialize, IdeError>(__TAURI_INVOKE("debug_evaluate_in", { session, frameId, expression, context })),
 	debugExceptionFilters: () => typedError<SessionExceptionFilters[], IdeError>(__TAURI_INVOKE("debug_exception_filters")),
 	/**  Force Step Over: step over with every breakpoint suspended until the step ends. */
 	debugForceStepOver: (session: DebugSessionId, threadId: number) => typedError<null, IdeError>(__TAURI_INVOKE("debug_force_step_over", { session, threadId })),
@@ -419,6 +442,7 @@ export const commands = {
 	debugPause: (session: DebugSessionId, threadId: number) => typedError<null, IdeError>(__TAURI_INVOKE("debug_pause", { session, threadId })),
 	/**  HotSwap (Reload Changed Classes) in a java-debug session. */
 	debugRedefineClasses: (session: DebugSessionId) => typedError<HotSwapResult, IdeError>(__TAURI_INVOKE("debug_redefine_classes", { session })),
+	debugResolveVariable: (session: DebugSessionId, variable: Variable_Deserialize) => typedError<Variable_Serialize, IdeError>(__TAURI_INVOKE("debug_resolve_variable", { session, variable })),
 	/**  Reset Frame (Drop Frame). */
 	debugRestartFrame: (session: DebugSessionId, frameId: number) => typedError<null, IdeError>(__TAURI_INVOKE("debug_restart_frame", { session, frameId })),
 	debugResume: (session: DebugSessionId, threadId: number) => typedError<null, IdeError>(__TAURI_INVOKE("debug_resume", { session, threadId })),
@@ -434,7 +458,7 @@ export const commands = {
 	debugSetExceptionBreakpoints: (choices: { [key in string]: boolean }) => typedError<null, IdeError>(__TAURI_INVOKE("debug_set_exception_breakpoints", { choices })),
 	/**  Method breakpoints (all files); states aligned with `breakpoints`. */
 	debugSetFunctionBreakpoints: (breakpoints: FunctionBreakpoint[]) => typedError<BreakpointState[], IdeError>(__TAURI_INVOKE("debug_set_function_breakpoints", { breakpoints })),
-	debugSetVariable: (session: DebugSessionId, container: number, name: string, evaluateName: string | null, frameId: number | null, value: string) => typedError<Variable, IdeError>(__TAURI_INVOKE("debug_set_variable", { session, container, name, evaluateName, frameId, value })),
+	debugSetVariable: (session: DebugSessionId, container: number, name: string, evaluateName: string | null, frameId: number | null, value: string) => typedError<Variable_Serialize, IdeError>(__TAURI_INVOKE("debug_set_variable", { session, container, name, evaluateName, frameId, value })),
 	debugStackTrace: (session: DebugSessionId, threadId: number) => typedError<StackFrame[], IdeError>(__TAURI_INVOKE("debug_stack_trace", { session, threadId })),
 	/**  Starts a session owned by this window: its events (and those of child sessions) go here only. */
 	debugStart: (config: LaunchConfig) => typedError<DebugSessionId, IdeError>(__TAURI_INVOKE("debug_start", { config })),
@@ -460,7 +484,7 @@ export const commands = {
 { kind: "finished" } | null, IdeError>(__TAURI_INVOKE("debug_stream_trace_abort", { session })),
 	debugThreads: (session: DebugSessionId) => typedError<ThreadInfo[], IdeError>(__TAURI_INVOKE("debug_threads", { session })),
 	debugUnityProcesses: () => typedError<AttachableProcess[], IdeError>(__TAURI_INVOKE("debug_unity_processes")),
-	debugVariables: (session: DebugSessionId, reference: number) => typedError<Variable[], IdeError>(__TAURI_INVOKE("debug_variables", { session, reference })),
+	debugVariables: (session: DebugSessionId, reference: number) => typedError<Variable_Serialize[], IdeError>(__TAURI_INVOKE("debug_variables", { session, reference })),
 	dependencyVersions: (doc: DocId, offset: number | null, request: RequestId) => typedError<DependencyVersions[], IdeError>(__TAURI_INVOKE("dependency_versions", { doc, offset, request })),
 	deployCompare: (path: IpcPath, server: string | null, request: RequestId) => typedError<SyncEntry[], IdeError>(__TAURI_INVOKE("deploy_compare", { path, server, request })),
 	deployCoverage: (paths: IpcPath[]) => typedError<DeploymentCoverage[], IdeError>(__TAURI_INVOKE("deploy_coverage", { paths })),
@@ -526,13 +550,15 @@ export const commands = {
 	docOpenVirtual: (uri: string) => typedError<DocumentInfo, IdeError>(__TAURI_INVOKE("doc_open_virtual", { uri })),
 	/**
 	 *  Structure view: LSP document symbols when available (with tree-sitter
-	 *  visibility), tree-sitter otherwise.
+	 *  visibility and type-alias kinds), tree-sitter otherwise.
 	 *  Tree-sitter answers come from the per-document tree cache (incremental
 	 *  re-parse); large documents get no syntax structure.
 	 */
 	docOutline: (doc: DocId) => typedError<OutlineItem[], IdeError>(__TAURI_INVOKE("doc_outline", { doc })),
 	/**  Python class facts for the inheritance inspections: tree-sitter, no language server. */
 	docPythonFacts: (doc: DocId) => typedError<PythonFacts, IdeError>(__TAURI_INVOKE("doc_python_facts", { doc })),
+	/**  Load Changes from Disk: discards the buffer's unsaved changes and reads its file again. */
+	docReloadFromDisk: (doc: DocId) => typedError<null, IdeError>(__TAURI_INVOKE("doc_reload_from_disk", { doc })),
 	docSave: (doc: DocId) => typedError<null, IdeError>(__TAURI_INVOKE("doc_save", { doc })),
 	docSaveAll: () => typedError<null, IdeError>(__TAURI_INVOKE("doc_save_all")),
 	/**
@@ -960,8 +986,9 @@ export const commands = {
 	mavenExcludeDependency: (pom: string, dependency: ArtifactKey, exclusion: ArtifactKey) => typedError<Location, IdeError>(__TAURI_INVOKE("maven_exclude_dependency", { pom, dependency, exclusion })),
 	/**
 	 *  The go-to-declaration target at `pos` of a Maven POM: the definition of the
-	 *  `${property}` at the caret, or the `<dependencyManagement>` / `<pluginManagement>`
-	 *  entry providing the dependency's / plugin's version, along the parent chain.
+	 *  `${property}` at the caret, the parent POM, or the dependency / plugin's own POM
+	 *  (a project module first, then the local repository). A dependency without a
+	 *  resolvable artifact POM falls back to its management entry.
 	 */
 	mavenGotoDeclaration: (pom: string, pos: Pos) => typedError<{
 	/**
@@ -975,6 +1002,12 @@ export const commands = {
 	/**  The declaration as named for the user (`example.version`, `com.example:example-lib`). */
 	label: string,
 } | null, IdeError>(__TAURI_INVOKE("maven_goto_declaration", { pom, pos })),
+	/**
+	 *  Gutter targets of the unversioned dependencies and plugins in a Maven POM:
+	 *  the management declarations that actually supply their versions, including
+	 *  parent POMs and imported BOMs. Cancel with `cancel_request(request)`.
+	 */
+	mavenManagedDeclarations: (pom: string, request: RequestId) => typedError<PomManagedDeclaration[], IdeError>(__TAURI_INVOKE("maven_managed_declarations", { pom, request })),
 	/**  The user closed the Run tool window tab of an agent command (`run_command`). */
 	mcpAgentRunClosed: (name: string) => typedError<null, IdeError>(__TAURI_INVOKE("mcp_agent_run_closed", { name })),
 	/**
@@ -1007,7 +1040,7 @@ export const commands = {
 	 */
 	menuConfigure: (config: MenuConfig) => __TAURI_INVOKE<void>("menu_configure", { config }),
 	/**  The menu bar for a title bar drawn by the frontend (Windows). */
-	menuModel: () => __TAURI_INVOKE<MenuNode[]>("menu_model"),
+	menuModel: () => __TAURI_INVOKE<MenuNode_Serialize[]>("menu_model"),
 	/**
 	 *  Updates the menu after the recent-projects list changed. Only the Open Recent
 	 *  submenu is rewritten when the rest of the menu is unchanged.
@@ -1334,6 +1367,12 @@ export const commands = {
 	remoteDelete: (connection: FsConnection, path: string) => typedError<null, IdeError>(__TAURI_INVOKE("remote_delete", { connection, path })),
 	remoteDisconnect: () => __TAURI_INVOKE<void>("remote_disconnect"),
 	remoteDownloadInto: (connection: FsConnection, paths: string[], target: IpcPath, request: RequestId) => typedError<TransferReport, IdeError>(__TAURI_INVOKE("remote_download_into", { connection, paths, target, request })),
+	/**
+	 *  The project view's Download to…: remote files and folders of this window's project into the
+	 *  local folder `target`, each under its own name. Like Remote Host › Download to…, nothing is
+	 *  written outside `target`, even through a local symlink inside it.
+	 */
+	remoteDownloadLocal: (paths: string[], target: string, request: RequestId, onProgress: Channel<DownloadProgress>) => typedError<TransferReport, IdeError>(__TAURI_INVOKE("remote_download_local", { paths, target, request, onProgress })),
 	/**
 	 *  Forwards `localhost:<remote_port>` of the remote host to the same port here when it is free,
 	 *  else to a free one. Nothing needs to listen there yet; connections are opened per use.
@@ -1914,6 +1953,12 @@ export const commands = {
 	/**  Focuses the next / previous window (⌘` / ⇧⌘`). */
 	windowCycle: (forward: boolean) => __TAURI_INVOKE<void>("window_cycle", { forward }),
 	/**
+	 *  Drags `paths` (local files and folders) out of `window` while the primary mouse button is
+	 *  still down, so the app they are dropped on copies them (#2867). Resolves when the drag ends,
+	 *  with whether a target took the files.
+	 */
+	windowDragFiles: (paths: string[]) => typedError<boolean, IdeError>(__TAURI_INVOKE("window_drag_files", { paths })),
+	/**
 	 *  Flash (`true`) or stop flashing (`false`) this window's taskbar button, like IDEA when a
 	 *  breakpoint is hit while the window is in the background (macOS bounces the dock icon,
 	 *  Linux sets the urgency hint). A focused window is never flashed: the user is already
@@ -2144,6 +2189,8 @@ export type AgentCapabilities = {
 	steer?: boolean,
 	/**  It reports its background tasks and stops them one by one. */
 	backgroundTasks?: boolean,
+	/**  The connected agent can report a breakdown of its context window. */
+	contextUsage?: boolean,
 };
 
 /**
@@ -2158,6 +2205,8 @@ export type AgentChange = {
 	removed: number,
 	/**  Path before a rename; the left side of its diff reads this path. */
 	oldPath: string | null,
+	/**  The repository the file is in, when the task's project holds nested repositories. */
+	repo: IpcPath | null,
 };
 
 /**  A task's uncommitted files and the commits made since it started. */
@@ -2179,6 +2228,18 @@ export type AgentChangesView =
 "group" | 
 /**  What the last turn changed, against the checkout as that turn started. */
 "lastTurn";
+
+export type AgentCliOffer = {
+	current: string,
+	latest: string,
+	prefix: string,
+};
+
+export type AgentCliUpdateResult = {
+	status: "available",
+} & AgentCliOffer | {
+	status: "permission",
+} & AgentCliOffer | ({ status: "current"; current: string }) & { code?: never } | ({ status: "channel"; current: string }) & { code?: never } | ({ status: "updated"; current: string }) & { code?: never } | ({ status: "unmanaged" }) & { code?: never; current?: never } | ({ status: "error"; code: string }) & { current?: never };
 
 export type AgentCommand = {
 	/**  Without the leading `/`. */
@@ -2247,6 +2308,21 @@ export type AgentConfigVia =
 "mode" | 
 /**  `session/set_model` (agents that report `models` instead of a model config option). */
 "model";
+
+export type AgentContextCategory = {
+	name: string,
+	tokens: number,
+	kind: string | null,
+};
+
+export type AgentContextUsage = {
+	categories: AgentContextCategory[],
+	totalTokens: number,
+	maxTokens: number,
+	model: string,
+	isAutoCompactEnabled: boolean | null,
+	autoCompactThreshold: number | null,
+};
 
 export type AgentCost = {
 	amount: number | null,
@@ -2521,6 +2597,8 @@ export type AgentProvider = {
 	commandReadOnlyReason: AgentCommandReadOnlyReason | null,
 	/**  Whether the command was found (on `PATH`). */
 	installed: boolean,
+	/**  The built-in command can be owned by a global npm package. */
+	canCheckCliUpdate?: boolean,
 	/**  Environment variables it starts with (from its agent file). */
 	env: { [key in string]: string },
 	/**  Settings (models, modes…) the agent offered last time it ran; empty before its first session. */
@@ -2624,6 +2702,11 @@ export type AgentSettings_Deserialize = {
 	 *  keyed by server name (`[agents.mcpServers.<name>]`).
 	 */
 	mcpServers?: { [key in string]: AgentMcpServer_Deserialize },
+	/**
+	 *  How agent skills may run, keyed by skill name (`[agents.skills.<name>]`); `SKILL.md`
+	 *  files on disk are never modified.
+	 */
+	skills?: { [key in string]: AgentSkillPolicy_Deserialize },
 };
 
 /**  Settings › Agents: what the conversation shows and how messages are sent. */
@@ -2664,6 +2747,89 @@ export type AgentSettings_Serialize = {
 	 *  keyed by server name (`[agents.mcpServers.<name>]`).
 	 */
 	mcpServers: { [key in string]: AgentMcpServer_Serialize },
+	/**
+	 *  How agent skills may run, keyed by skill name (`[agents.skills.<name>]`); `SKILL.md`
+	 *  files on disk are never modified.
+	 */
+	skills: { [key in string]: AgentSkillPolicy_Serialize },
+};
+
+/**  One discovered skill: a folder with a `SKILL.md`. */
+export type AgentSkill = {
+	/**  The frontmatter `name`, else the folder's name. */
+	name: string,
+	description: string,
+	/**  Canonical folder holding `SKILL.md` (symlinks resolved, so duplicates collapse). */
+	path: IpcPath,
+	source: AgentSkillSource,
+	/**  The `SKILL.md` passes validation (`name` matches its folder, `description` present). */
+	valid: boolean,
+	/**  What validation found (`name` mismatch, missing or over-long description…). */
+	warnings: string[],
+};
+
+/**  How an agent skill may run (`[agents.skills.<name>] mode = …`). */
+export type AgentSkillMode = 
+/**  The model decides when to use it. */
+"auto" | 
+/**  Only when the user invokes it with `/name`. */
+"slashOnly" | 
+/**  Never. */
+"off";
+
+/**  Which layer decided a skill's [`AgentSkillState::mode`]. */
+export type AgentSkillOrigin = "none" | "session" | "workspace" | "user" | 
+/**  An untrusted workspace's skills and policies may only turn skills off. */
+"trust";
+
+/**  A skill's policy in Settings › Agents › Skills, stored without touching its `SKILL.md`. */
+export type AgentSkillPolicy = AgentSkillPolicy_Serialize | AgentSkillPolicy_Deserialize;
+
+/**  A skill's policy in Settings › Agents › Skills, stored without touching its `SKILL.md`. */
+export type AgentSkillPolicy_Deserialize = {
+	mode?: AgentSkillMode,
+};
+
+/**  A skill's policy in Settings › Agents › Skills, stored without touching its `SKILL.md`. */
+export type AgentSkillPolicy_Serialize = {
+	mode: AgentSkillMode,
+};
+
+/**  Which CLI's own folders a skill was discovered in (Settings › Agents › Skills groups by it). */
+export type AgentSkillSource = 
+/**  The project's `.agents/skills` and `.openidea/skills`. */
+"workspace" | 
+/**  The user's `~/.agents/skills` (what `npx skills add` fills). */
+"user" | 
+/**  The project's `.claude/skills`. */
+"claudeWorkspace" | 
+/**  `~/.claude/skills`. */
+"claudeUser" | 
+/**  The project's `.github/skills` (Copilot's repository skills). */
+"githubWorkspace" | 
+/**  `~/.copilot/skills` and `~/.copilot/installed-plugins/*`. */
+"copilotUser" | 
+/**  The project's `.codex/skills`. */
+"codexWorkspace" | 
+/**  `~/.codex/skills`. */
+"codexUser" | 
+/**  The project's `.cursor/skills`. */
+"cursorWorkspace" | 
+/**  `~/.cursor/skills`. */
+"cursorUser";
+
+/**
+ *  A skill as Settings › Agents › Skills shows it: discovery plus the effective mode and
+ *  which layer decided it.
+ */
+export type AgentSkillState = {
+	skill: AgentSkill,
+	mode: AgentSkillMode,
+	/**
+	 *  What set `mode`: a session override, the workspace, the user's settings, workspace
+	 *  trust, or nothing (the default `auto`).
+	 */
+	origin: AgentSkillOrigin,
 };
 
 /**  Where an agent comes from. */
@@ -2738,6 +2904,8 @@ export type AgentTask_Deserialize = {
 	background?: AgentBackgroundTask[],
 	/**  Per-session MCP server enable/disable overrides (`server_name` -> `enabled`), including `"openidea"`. */
 	mcpOverrides?: { [key in string]: boolean },
+	/**  Per-session skill modes (`skill name` -> mode), on top of the settings' policies. */
+	skillOverrides?: { [key in string]: AgentSkillMode },
 	/**  Token counts of the last turn and context compressions, when the agent reports them. */
 	stats?: AgentSessionStats,
 };
@@ -2788,6 +2956,8 @@ export type AgentTask_Serialize = {
 	background: AgentBackgroundTask[],
 	/**  Per-session MCP server enable/disable overrides (`server_name` -> `enabled`), including `"openidea"`. */
 	mcpOverrides?: { [key in string]: boolean },
+	/**  Per-session skill modes (`skill name` -> mode), on top of the settings' policies. */
+	skillOverrides?: { [key in string]: AgentSkillMode },
 	/**  Token counts of the last turn and context compressions, when the agent reports them. */
 	stats: AgentSessionStats,
 };
@@ -3738,6 +3908,7 @@ export type CommitSettings = {
 	 *  window and a Commit dialog.
 	 */
 	nonModal?: boolean,
+	includeChangesByDefault?: boolean,
 	/**  Start with an empty message instead of the last one / the changelist's. */
 	clearInitialMessage?: boolean,
 	analyzeCode?: boolean,
@@ -3770,6 +3941,8 @@ export type CommitSettings = {
 	agentModel?: string,
 	/**  That model's thinking level for commit messages; empty keeps the agent's. */
 	agentEffort?: string,
+	/**  Show the Generate Commit Message with Agent button above the commit message. */
+	agentButton?: boolean,
 };
 
 export type Commit_Deserialize = {
@@ -3783,6 +3956,8 @@ export type Commit_Deserialize = {
 	historyPath?: string | null,
 	logPosition?: number | null,
 	logTotal?: number | null,
+	/**  Newest committer time at or after this row if newer than the row's commit. */
+	logMergeTimeMs?: number | null,
 	graphBoundaryParents?: string[],
 	/**  Reachability from HEAD, computed independently of the visible filters. */
 	onCurrentBranch?: boolean | null,
@@ -3812,6 +3987,8 @@ export type Commit_Serialize = {
 	historyPath?: string | null,
 	logPosition?: number | null,
 	logTotal?: number | null,
+	/**  Newest committer time at or after this row if newer than the row's commit. */
+	logMergeTimeMs?: number | null,
 	graphBoundaryParents?: string[],
 	/**  Reachability from HEAD, computed independently of the visible filters. */
 	onCurrentBranch?: boolean | null,
@@ -5106,28 +5283,28 @@ export type DiffSide = DiffSide_Serialize | DiffSide_Deserialize;
 /**  One side of a diff window's comparison (the UI's `DiffSide`, `diffInput.ts`). */
 export type DiffSide_Deserialize = 
 /**  File content at a Git revision (`HEAD`, `:0` = index, a commit id). */
-({ type: "rev"; rev: string; path?: string | null; label?: string | null }) & { id?: never; text?: never } | 
+({ type: "rev"; rev: string; path?: string | null; label?: string | null }) & { id?: never; labelDetail?: never; text?: never } | 
 /**  The working file (unsaved editor buffer included). */
-({ type: "worktree"; label?: string | null }) & { id?: never; path?: never; rev?: never; text?: never } | 
+({ type: "worktree"; label?: string | null; labelDetail?: string | null }) & { id?: never; path?: never; rev?: never; text?: never } | 
 /**  Another file (Compare With…, Compare Files). */
-({ type: "file"; path: string; label?: string | null }) & { id?: never; rev?: never; text?: never } | 
-/**  Literal text: a side that does not exist. */
-({ type: "text"; text: string; label: string }) & { id?: never; path?: never; rev?: never } | 
+({ type: "file"; path: string; label?: string | null }) & { id?: never; labelDetail?: never; rev?: never; text?: never } | 
+/**  Literal text, such as clipboard contents or an editor selection. */
+({ type: "text"; text: string; label: string; labelDetail?: string | null }) & { id?: never; path?: never; rev?: never } | 
 /**  A Local History revision. */
-({ type: "history"; id: string; label: string }) & { path?: never; rev?: never; text?: never };
+({ type: "history"; id: string; label: string }) & { labelDetail?: never; path?: never; rev?: never; text?: never };
 
 /**  One side of a diff window's comparison (the UI's `DiffSide`, `diffInput.ts`). */
 export type DiffSide_Serialize = 
 /**  File content at a Git revision (`HEAD`, `:0` = index, a commit id). */
-({ type: "rev"; rev: string; path?: string | null; label?: string | null }) & { id?: never; text?: never } | 
+({ type: "rev"; rev: string; path?: string | null; label?: string | null }) & { id?: never; labelDetail?: never; text?: never } | 
 /**  The working file (unsaved editor buffer included). */
-({ type: "worktree"; label?: string | null }) & { id?: never; path?: never; rev?: never; text?: never } | 
+({ type: "worktree"; label?: string | null; labelDetail?: string | null }) & { id?: never; path?: never; rev?: never; text?: never } | 
 /**  Another file (Compare With…, Compare Files). */
-({ type: "file"; path: string; label?: string | null }) & { id?: never; rev?: never; text?: never } | 
-/**  Literal text: a side that does not exist. */
-({ type: "text"; text: string; label: string }) & { id?: never; path?: never; rev?: never } | 
+({ type: "file"; path: string; label?: string | null }) & { id?: never; labelDetail?: never; rev?: never; text?: never } | 
+/**  Literal text, such as clipboard contents or an editor selection. */
+({ type: "text"; text: string; label: string; labelDetail?: string | null }) & { id?: never; path?: never; rev?: never } | 
 /**  A Local History revision. */
-({ type: "history"; id: string; label: string }) & { path?: never; rev?: never; text?: never };
+({ type: "history"; id: string; label: string }) & { labelDetail?: never; path?: never; rev?: never; text?: never };
 
 export type DirectoryCompareEntry = {
 	path: string,
@@ -5450,6 +5627,13 @@ export type DocumentTextChange = {
 	insert: string,
 };
 
+/**  One file of a [`remote_download_local`] transfer starting: `done` of `total` files are finished. */
+export type DownloadProgress = {
+	path: string,
+	done: number,
+	total: number,
+};
+
 export type DuplicateGroup = {
 	tokens: number,
 	/**  Lines of the first fragment. */
@@ -5567,21 +5751,34 @@ export type EditorGeneralSettings = {
 	richTextCopy?: boolean,
 };
 
-/**  A file opened in a lightweight editor window, with optional caret / selection (0-based). */
+/**
+ *  What a lightweight editor window shows: a file, with optional caret / selection (0-based), or
+ *  the tab of another editor kind.
+ */
 export type EditorLaunch = EditorLaunch_Serialize | EditorLaunch_Deserialize;
 
-/**  A file opened in a lightweight editor window, with optional caret / selection (0-based). */
+/**
+ *  What a lightweight editor window shows: a file, with optional caret / selection (0-based), or
+ *  the tab of another editor kind.
+ */
 export type EditorLaunch_Deserialize = {
-	path: IpcPath,
+	path?: IpcPath | null,
+	/**  The tab's editor input, as JSON. */
+	input?: string | null,
 	line?: number | null,
 	column?: number | null,
 	endLine?: number | null,
 	endColumn?: number | null,
 };
 
-/**  A file opened in a lightweight editor window, with optional caret / selection (0-based). */
+/**
+ *  What a lightweight editor window shows: a file, with optional caret / selection (0-based), or
+ *  the tab of another editor kind.
+ */
 export type EditorLaunch_Serialize = {
-	path: IpcPath,
+	path?: IpcPath | null,
+	/**  The tab's editor input, as JSON. */
+	input?: string | null,
 	line?: number | null,
 	column?: number | null,
 	endLine?: number | null,
@@ -6221,9 +6418,12 @@ export type FoldRange = {
 	kind: FoldKind,
 };
 
+export type FoldingOutlineVisibility = "hover" | "always";
+
 /**  Editor › General › Code Folding. */
 export type FoldingSettings = {
 	showOutline?: boolean,
+	outlineVisibility?: FoldingOutlineVisibility,
 	fileHeader?: boolean,
 	imports?: boolean,
 	docComments?: boolean,
@@ -6448,6 +6648,8 @@ export type GitSettings = {
 	 */
 	inlineBlameClickable?: boolean,
 	showBranchInProjectView?: boolean,
+	/**  Branch operations from the branches popup act on every repository of the project. */
+	syncBranchOperations?: boolean,
 	/**  Path to the git executable; empty = auto-detect. */
 	executable?: string,
 	/**  Default of Update Project: `merge` | `rebase`. */
@@ -7024,8 +7226,15 @@ workspaceEdit?: boolean } |
 { type: "docDirty"; doc: DocId; dirty: boolean; 
 /**  Text version when this transition occurred, including when it was saved. */
 version: number } | 
+/**
+ *  An open document's file changed on disk while the buffer had unsaved changes. The buffer
+ *  keeps them (autosave leaves the file alone); the UI offers to load the disk version.
+ */
+{ type: "docDiskConflict"; doc: DocId; path: string } | 
 /**  A complete workspace edit can be undone as one operation. */
 { type: "workspaceEditApplied"; id: number; paths: IpcPath[]; 
+/**  Files the edit renamed, as the edit named them: editors open on them follow. */
+moves: FileMove[]; 
 /**
  *  Made by an agent through the MCP server's tools: undoable like a refactoring, but
  *  not announced as one.
@@ -8061,7 +8270,10 @@ export type LineMarkerInfo = {
 export type LineMatch = {
 	/**  0-based line. */
 	line: number,
-	/**  Line text, truncated around the match for very long lines. */
+	/**
+	 *  Line text, truncated around the matches for very long lines: such a line comes as one
+	 *  `LineMatch` per window, so the same `line` can repeat.
+	 */
 	text: string,
 	/**  UTF-16 column ranges within `text`. */
 	ranges: ([number, number])[],
@@ -8756,16 +8968,41 @@ export type MenuConfig = {
  *  A menu entry for a menu bar drawn by the frontend (Windows title bar).
  *  Labels are the English defaults; the frontend localises them like the native menu.
  */
-export type MenuNode = { kind: "submenu"; id: string; label: string; children: MenuNode[] } | 
+export type MenuNode = MenuNode_Serialize | MenuNode_Deserialize;
+
+/**
+ *  A menu entry for a menu bar drawn by the frontend (Windows title bar).
+ *  Labels are the English defaults; the frontend localises them like the native menu.
+ */
+export type MenuNode_Deserialize = ({ kind: "submenu"; id: string; label: string; 
+/**  Saved layout selection, unset for ordinary submenus. */
+current: boolean | null; children: MenuNode_Deserialize[] }) & { arg?: never; checked?: never; hint?: never } | 
 /**
  *  Runs `id` with `arg`. Items with an `arg` (Open Recent) carry their final label.
  *  `checked` is the state of a frontend-listed toggle (Status Bar Widgets). Spec toggles
  *  leave it unset: the frontend menu reads their state from the action (`toggled`), the
  *  source [`MenuConfig::checked`] is built from for the native menu.
  */
-{ kind: "action"; id: string; label: string; hint: string | null; arg: string | null; checked: boolean | null } | 
+({ kind: "action"; id: string; label: string; hint: string | null; arg: string | null; checked: boolean | null }) & { children?: never; current?: never } | 
 /**  A disabled placeholder such as "No Recent Projects". */
-{ kind: "placeholder"; id: string; label: string } | { kind: "separator" };
+({ kind: "placeholder"; id: string; label: string }) & { arg?: never; checked?: never; children?: never; current?: never; hint?: never } | ({ kind: "separator" }) & { arg?: never; checked?: never; children?: never; current?: never; hint?: never; id?: never; label?: never };
+
+/**
+ *  A menu entry for a menu bar drawn by the frontend (Windows title bar).
+ *  Labels are the English defaults; the frontend localises them like the native menu.
+ */
+export type MenuNode_Serialize = ({ kind: "submenu"; id: string; label: string; 
+/**  Saved layout selection, unset for ordinary submenus. */
+current?: boolean | null; children: MenuNode_Serialize[] }) & { arg?: never; checked?: never; hint?: never } | 
+/**
+ *  Runs `id` with `arg`. Items with an `arg` (Open Recent) carry their final label.
+ *  `checked` is the state of a frontend-listed toggle (Status Bar Widgets). Spec toggles
+ *  leave it unset: the frontend menu reads their state from the action (`toggled`), the
+ *  source [`MenuConfig::checked`] is built from for the native menu.
+ */
+({ kind: "action"; id: string; label: string; hint: string | null; arg: string | null; checked: boolean | null }) & { children?: never; current?: never } | 
+/**  A disabled placeholder such as "No Recent Projects". */
+({ kind: "placeholder"; id: string; label: string }) & { arg?: never; checked?: never; children?: never; current?: never; hint?: never } | ({ kind: "separator" }) & { arg?: never; checked?: never; children?: never; current?: never; hint?: never; id?: never; label?: never };
 
 /**  Merge dialog › Modify options (shared by the Pull dialog). */
 export type MergeOptions = {
@@ -8914,6 +9151,8 @@ export type NewAgentTask = {
 	base: string | null,
 	/**  Per-session MCP server enable/disable overrides (`server_name` -> `enabled`). */
 	mcpOverrides?: { [key in string]: boolean },
+	/**  Per-session skill modes (`skill name` -> mode). */
+	skillOverrides?: { [key in string]: AgentSkillMode },
 	/**
 	 *  Creates the task without sending `prompt` (it only names the task): the composer's
 	 *  `!` command runs in it first.
@@ -9750,6 +9989,16 @@ export type PomGotoKind =
 "managedPlugin" | 
 /**  The POM of the artifact itself: a project module's, else the local repository's. */
 "artifactPom";
+
+/**  A dependency or plugin whose version comes from a management declaration. */
+export type PomManagedDeclaration = {
+	/**  0-based line of the `<dependency>` or `<plugin>` declaration. */
+	line: number,
+	/**  The interpolated version the management entry provides, when it has one. */
+	version: string | null,
+	/**  The management entry, possibly in a parent POM or an imported BOM. */
+	target: PomGoto,
+};
 
 /**  A 0-based line / UTF-16 column position. */
 export type Pos = {
@@ -12274,13 +12523,34 @@ export type UpdateStatus = {
 	checking: boolean,
 };
 
-export type Variable = {
+export type Variable = Variable_Serialize | Variable_Deserialize;
+
+export type Variable_Deserialize = {
 	name: string,
 	value: string,
 	typeName: string | null,
 	/**  > 0 when expandable. */
 	variablesReference: number,
 	evaluateName: string | null,
+	/**
+	 *  `value` is not computed yet (DAP `presentationHint.lazy`): the single variable that
+	 *  `variables` returns for `variables_reference` holds the value and its children.
+	 */
+	lazy?: boolean,
+};
+
+export type Variable_Serialize = {
+	name: string,
+	value: string,
+	typeName: string | null,
+	/**  > 0 when expandable. */
+	variablesReference: number,
+	evaluateName: string | null,
+	/**
+	 *  `value` is not computed yet (DAP `presentationHint.lazy`): the single variable that
+	 *  `variables` returns for `variables_reference` holds the value and its children.
+	 */
+	lazy?: boolean,
 };
 
 /**  Version Control › Confirmation. */
@@ -12322,6 +12592,8 @@ export type VcsRoot = {
 export type VcsSettings = {
 	/**  Colour folders that contain changed files (project tree, tabs). */
 	showDirtyDirectories?: boolean,
+	/**  Diffs the user opens show in an editor tab; off, in a separate window. */
+	diffAsEditorTab?: boolean,
 	/**  Stop file history (Show History) after `history_limit` commits. */
 	limitHistory?: boolean,
 	historyLimit?: number,
