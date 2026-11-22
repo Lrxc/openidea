@@ -553,6 +553,28 @@
   gap: 1px;
 }
 
+/* Diff & Merge preview embeds a three-pane merge view (the `mergeSchemePreview` editor kind)
+   painted with the real diff decorations; clicking a coloured line selects its attribute. */
+.diffPreview {
+  margin: 14px 0 0;
+  border-radius: var(--radius-small);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  background: var(--bg-editor, var(--bg-island));
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 300px;
+}
+.diffLoading {
+  padding: var(--space-3);
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+}
+.diffPreview :global(.cm-editor) {
+  font-size: var(--fs-code);
+}
+
 /* Code Style tables */
 .guides {
   width: 160px;

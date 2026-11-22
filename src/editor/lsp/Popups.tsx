@@ -1,4 +1,5 @@
 /** React popups for LSP editor features, rendered as a workbench overlay. */
+import { openCodeLocation } from "@/editor/api";
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import clsx from "clsx";
 import {
@@ -21,8 +22,7 @@ import {
   selectableText,
   T,
 } from "@/ui";
-import { basename, relativePath, useProject } from "@/platform/project";
-import { editorService } from "@/workbench/contributions";
+import { basename, relativeDir, relativePath, useProject } from "@/platform/project";
 import {
   closePopup,
   updatePopup,
@@ -108,25 +108,21 @@ function listPopupRows(items: ListPopupItem[], query: string): ListPopupRow[] {
 }
 
 function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
+  const copyPath = popup.layout === "copyPath";
   const [query, setQuery] = useState("");
   const rows = useMemo(() => listPopupRows(popup.items, query), [popup.items, query]);
   const firstEnabled = rows.findIndex((row) => row.kind === "action" && !row.item.disabled);
-  const [active, setActive] = useState(firstEnabled);
-  const clamped = Math.min(active, rows.length - 1);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const selected = rows.findIndex((row) => row.kind === "action" && row.item.id === activeId);
   const activeIndex =
-    rows[clamped]?.kind === "action"
-      ? clamped
-      : firstEnabled >= 0
-        ? firstEnabled
-        : firstSelectable(rows, isListSection);
+    selected >= 0 ? selected : firstEnabled >= 0 ? firstEnabled : firstSelectable(rows, isListSection);
   const activeRow = rows[activeIndex];
   const activeItem = activeRow?.kind === "action" ? activeRow.item : undefined;
   const showIcons = !popup.compact || popup.items.some((item) => item.icon || item.symbol);
+  const hasTargets = popup.items.some((item) => item.target);
 
   // Choosers highlight what the selected row would act on.
-  useEffect(() => {
-    activeItem?.onActive?.();
-  }, [activeItem]);
+  useEffect(() => activeItem?.onActive?.(), [activeItem]);
 
   const [preview, setPreview] = useState<{ id: string; data: ListPreview | null } | null>(null);
   const fetchPreview = popup.preview;
@@ -183,11 +179,11 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
       if (item) activate(item);
     } else if (e.key === "Backspace" && query) {
       setQuery(query.slice(0, -1));
-      setActive(-1);
+      setActiveId(null);
       e.preventDefault();
     } else if (e.key.length === 1 && !(e.key === " " && !query)) {
       setQuery(query + e.key);
-      setActive(-1);
+      setActiveId(null);
       e.preventDefault();
     }
   };
@@ -202,7 +198,13 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
     const chars = Math.max(
       popup.title.length + (popup.pin ? 4 : 0),
       ...popup.items.map(
-        (i) => i.label.length + (i.preview?.length ?? 0) + (i.detail?.length ?? 0) + (i.shortcut?.length ?? 0),
+        (i) =>
+          i.label.length +
+          (i.leadingDetail?.length ?? 0) +
+          (i.preview?.length ?? 0) +
+          (i.detail?.length ?? 0) +
+          (i.target ? i.target.path.length + (i.target.container?.length ?? 0) + 3 : 0) +
+          (i.shortcut?.length ?? 0),
       ),
     );
     const padding = popup.compact ? 44 + (showIcons ? 20 : 0) : 90;
@@ -216,28 +218,32 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
         : null
     : null;
   const hasPreview = shownPreview !== null;
+  const point = popup.anchor === "center" ? null : popup.anchor;
   const previewBelow = hasPreview && viewportWidth <= MIN_SIDE_BY_SIDE_WIDTH;
   const previewLeft =
+    point &&
     hasPreview &&
     !previewBelow &&
-    popup.anchor.x + width + LIST_PREVIEW_WIDTH > viewportWidth - 6 &&
-    popup.anchor.x >= LIST_PREVIEW_WIDTH + 6;
+    point.x + width + LIST_PREVIEW_WIDTH > viewportWidth - 6 &&
+    point.x >= LIST_PREVIEW_WIDTH + 6;
   const anchor = useMemo(() => {
-    if (!fetchPreview) return popup.anchor;
-    const x = popup.anchor.x - (previewLeft ? LIST_PREVIEW_WIDTH : 0);
+    if (!point || !fetchPreview) return popup.anchor;
+    const x = point.x - (previewLeft ? LIST_PREVIEW_WIDTH : 0);
     return {
       getBoundingClientRect: () =>
         new DOMRect(
           Math.max(0, Math.min(x, window.innerWidth)),
-          Math.max(0, Math.min(popup.anchor.y, window.innerHeight)),
+          Math.max(0, Math.min(point.y, window.innerHeight)),
           0,
           0,
         ),
     };
-  }, [fetchPreview, popup.anchor, previewLeft]);
+  }, [fetchPreview, point, popup.anchor, previewLeft]);
+  const leadingDetailChars = Math.max(0, ...popup.items.map((item) => item.leadingDetail?.length ?? 0));
   const popupSize = {
-    width: hasPreview ? width + LIST_PREVIEW_WIDTH : width,
+    ...(!copyPath && { width: hasPreview ? width + LIST_PREVIEW_WIDTH : width }),
     "--list-preview-width": `${LIST_PREVIEW_WIDTH}px`,
+    "--list-leading-detail-width": `${leadingDetailChars + 1}ch`,
   } as CSSProperties;
   const indexOf = (item: ListPopupItem) => popup.items.indexOf(item);
   return (
@@ -246,12 +252,16 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
       anchor={anchor}
       onClose={closePopup}
       aria-label={popup.title}
+      resizable={copyPath ? "both" : undefined}
       className={clsx(
         styles.listPopup,
+        hasTargets && styles.targetPopup,
+        copyPath && styles.copyPathPopup,
         popup.compact && styles.compactListPopup,
         hasPreview && styles.withPreview,
         previewBelow && styles.previewBelow,
         previewLeft && styles.previewLeft,
+        popup.anchor === "center" && styles.centeredList,
       )}
       style={popupSize}
     >
@@ -283,7 +293,10 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
               row.kind === "section" && row.label ? <T>{row.label}</T> : <span className={styles.listDivider} />
             }
             activeIndex={activeIndex}
-            onActiveChange={setActive}
+            onActiveChange={(index) => {
+              const row = rows[index];
+              setActiveId(row?.kind === "action" ? row.item.id : null);
+            }}
             hoverSelects
             autoFocus
             aria-label={popup.title}
@@ -303,6 +316,8 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
               if (row.kind !== "action") return null;
               const { item, match } = row;
               const n = popup.numbered && !query ? indexOf(item) + 1 : 0;
+              const name = <HighlightedText className={styles.label} text={item.label} indices={match} tone="accent" />;
+              const shortcut = item.shortcut && <span className={styles.shortcut}>{item.shortcut}</span>;
               return (
                 <div
                   className={clsx(styles.item, item.disabled && styles.disabled, item.emphasis && styles.emphasis)}
@@ -311,17 +326,39 @@ function ListPopup({ popup }: { popup: Extract<LspPopup, { kind: "list" }> }) {
                   data-path={item.location?.path}
                   data-line={item.location?.line}
                 >
-                  {popup.numbered && <span className={styles.mnemonic}>{n > 0 && n <= 9 ? n : ""}</span>}
-                  {showIcons && <ItemIcon item={item} />}
-                  <HighlightedText className={styles.label} text={item.label} indices={match} tone="accent" />
-                  {item.preview && (
-                    <span className={styles.preview} title={item.preview}>
-                      {item.preview}
+                  {leadingDetailChars > 0 && (
+                    <span className={styles.leadingDetail} title={item.leadingDetail}>
+                      {item.leadingDetail}
                     </span>
                   )}
-                  <span className={styles.spacer} />
+                  {popup.numbered && <span className={styles.mnemonic}>{n > 0 && n <= 9 ? n : ""}</span>}
+                  {showIcons && <ItemIcon item={item} />}
+                  {item.target ? (
+                    <span className={styles.targetIdentity}>
+                      {name}
+                      {item.target.container && (
+                        <span className={styles.targetContainer} title={item.target.container}>
+                          ({item.target.container})
+                        </span>
+                      )}
+                    </span>
+                  ) : (
+                    name
+                  )}
+                  {copyPath && shortcut}
+                  {item.preview && (
+                    <span className={styles.preview} title={item.preview}>
+                      {copyPath ? <bdi>{item.preview}</bdi> : item.preview}
+                    </span>
+                  )}
+                  {!item.target && !copyPath && <span className={styles.spacer} />}
+                  {item.target && (
+                    <span className={styles.targetPath} title={item.target.path}>
+                      <bdi>{item.target.path}</bdi>
+                    </span>
+                  )}
                   {item.detail && <span className={styles.detail}>{item.detail}</span>}
-                  {item.shortcut && <span className={styles.shortcut}>{item.shortcut}</span>}
+                  {!copyPath && shortcut}
                   {item.submenu?.length ? (
                     <button
                       type="button"
@@ -549,10 +586,7 @@ function DefinitionPopup({ popup }: { popup: Extract<LspPopup, { kind: "definiti
   const targetIcon = (path: string) => fileIconName(basename(path), path);
   const open = () => {
     closePopup();
-    void editorService().openFile(location.path, {
-      selection: { line: location.range.start.line, col: location.range.start.col },
-      focus: true,
-    });
+    void openCodeLocation(location.path, { line: location.range.start.line, col: location.range.start.col });
   };
   const select = (index: number) =>
     updatePopup("definition", { index: (index + popup.targets.length) % popup.targets.length });
@@ -727,25 +761,34 @@ function PreviewDialog({ popup }: { popup: Extract<LspPopup, { kind: "preview" }
         </ul>
       ) : (
         <ul data-testid="refactor-preview" className={styles.previewList} aria-label={tx("Changes")}>
-          {summary.entries.map((e) => (
-            <li key={e.path} className={styles.previewRow}>
-              <Icon name={fileIconName(basename(e.path), e.path)} size={14} className={styles.itemIcon} />
-              <span className={styles.previewName} title={relativePath(root, e.path)}>
-                {basename(e.path)}
-              </span>
-              <span className={styles.previewPath} title={relativePath(root, e.path)}>
-                {relativePath(root, e.path)}
-              </span>
-              <span className={styles.spacer} />
-              {e.operation === "rename" && e.to && <span className={styles.previewOp}>→ {basename(e.to)}</span>}
-              {e.operation && e.operation !== "rename" && <span className={styles.previewOp}>{e.operation}</span>}
-              {e.edits > 0 && (
-                <span className={styles.previewCount}>
-                  {e.edits} {e.edits === 1 ? "occurrence" : "occurrences"}
+          {summary.entries.map((e) => {
+            const name = basename(e.path);
+            const directory = relativeDir(root, e.path);
+            return (
+              <li key={e.path} className={styles.previewRow}>
+                <Icon name={fileIconName(name, e.path)} size={14} className={styles.itemIcon} />
+                <span className={styles.previewFile} title={relativePath(root, e.path)}>
+                  <span className={styles.previewName}>{name}</span>
+                  {directory && (
+                    <span className={styles.previewDirectory}>
+                      <bdi>{directory}</bdi>
+                    </span>
+                  )}
                 </span>
-              )}
-            </li>
-          ))}
+                {e.operation === "rename" && e.to && (
+                  <span className={styles.previewOp} title={relativePath(root, e.to)}>
+                    → {basename(e.to)}
+                  </span>
+                )}
+                {e.operation && e.operation !== "rename" && <span className={styles.previewOp}>{e.operation}</span>}
+                {e.edits > 0 && (
+                  <span className={styles.previewCount}>
+                    {e.edits} {e.edits === 1 ? "occurrence" : "occurrences"}
+                  </span>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </Dialog>

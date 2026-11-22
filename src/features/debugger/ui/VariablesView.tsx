@@ -5,6 +5,9 @@ import clsx from "clsx";
 import { call, commands, type DebugSessionId, type Variable } from "@/platform/ipc";
 import { Dialog, Icon, Tree, acquirePopup, showContextMenu, type MenuItem, type TreeHandle } from "@/ui";
 import { formatMessage, tx } from "@/platform/i18n";
+import { fontWeightOf } from "@/platform/editorSettings";
+import { resolveMonoFont } from "@/platform/fonts";
+import { useProject } from "@/platform/project";
 import { activeEditor } from "@/editor/api";
 import { notifications } from "@/workbench/contributions";
 import { addFieldWatchpoint } from "../breakpoints/special";
@@ -16,11 +19,14 @@ import {
   removeAllWatches,
   removeWatch,
   revealFrame,
+  rootOf,
   sessionSupports,
   setVariableValue,
   useDebug,
 } from "../state";
 import { blurDebugView, focusDebugView } from "./focusedView";
+import { openTableView } from "./popoverStore";
+import { isTableType } from "../tableView";
 import { classifyValue, oneLine, shownValue, sortVariables } from "../values";
 import { stringText, valueText } from "../valueText";
 import { workflowSettings } from "@/platform/workflowSettings";
@@ -387,36 +393,41 @@ export function VariablesView({
   };
 
   const onContextMenu = (node: VarNode | null, _sel: Set<string>, e: React.MouseEvent) => {
-    if (!node || node.kind === "message") return;
+    if (!node || node.kind === "message" || node.kind === "scope") return;
     e.preventDefault();
     const items: MenuItem[] = [];
-    if (editable(node))
-      items.push(
-        { label: "Set Value…", icon: "edit", shortcut: "F2", run: () => startEdit(node) },
-        { kind: "separator" },
-      );
     if (node.kind === "watch")
       items.push(
         { label: "Remove Watch", icon: "minus", run: () => removeWatch(node.name) },
         { label: "Remove All Watches", run: removeAllWatches },
-      );
-    if (node.kind !== "scope") {
-      items.push({ label: "Copy Value", icon: "copy", run: () => void copyValue(node) });
-      items.push({ label: "Copy Name", run: () => void writeClipboardText(node.name) });
-      if (node.kind === "var" && node.evaluateName)
-        items.push({ label: "Add to Watches", icon: "eye", run: () => addWatch(node.evaluateName!) });
-      if (canWatch(node))
-        items.push({
-          label: "Add Field Watchpoint",
-          icon: "breakpoint-field",
-          run: () => void addWatchpointFor(session!, node),
-        });
-      items.push(
         { kind: "separator" },
-        { label: "Jump to Source", shortcut: "F4", run: () => void jumpToDeclaration(node) },
       );
-    }
-    if (items.length) showContextMenu(e, items);
+    if (editable(node)) items.push({ label: "Set Value…", icon: "edit", shortcut: "F2", run: () => startEdit(node) });
+    const tableExpression = node.evaluateName;
+    if (tableExpression && session != null && isTableType(node.typeName) && pausedIn(session)?.adapter === "debugpy")
+      items.push({ label: "View as Table", run: () => openTableView(tableExpression, session) });
+    items.push(
+      { label: "Copy Value", icon: "copy", run: () => void copyValue(node) },
+      { label: "Copy Name", run: () => void writeClipboardText(node.name) },
+    );
+
+    const watchActions: MenuItem[] = [];
+    const expression = node.evaluateName;
+    if (node.kind === "var" && expression)
+      watchActions.push({ label: "Add to Watches", icon: "eye", run: () => addWatch(expression) });
+    if (canWatch(node))
+      watchActions.push({
+        label: "Add Field Watchpoint",
+        icon: "breakpoint-field",
+        run: () => void addWatchpointFor(session!, node),
+      });
+    if (watchActions.length) items.push({ kind: "separator" }, ...watchActions);
+
+    items.push(
+      { kind: "separator" },
+      { label: "Jump to Source", shortcut: "F4", run: () => void jumpToDeclaration(node) },
+    );
+    showContextMenu(e, items);
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -456,6 +467,7 @@ export function VariablesView({
           editing?.key === n.key ? (
             <VarEditRow
               node={n}
+              changed={isChanged(n)}
               value={editing.value}
               error={editing.error}
               onChange={(value) => setEditing({ ...editing, value, error: null })}
@@ -475,6 +487,12 @@ export function VariablesView({
   );
 }
 
+/** The session with this id while it is paused, with the adapter its root session started. */
+function pausedIn(session: DebugSessionId | null) {
+  const s = session != null ? useDebug.getState().sessions[session] : undefined;
+  return s?.status === "paused" ? rootOf(s) : null;
+}
+
 /**
  * View: the whole value in a popup that a click outside closes. Adapters cut long strings
  * short in variables; the value is evaluated again as for copying (`clipboard`), which
@@ -490,6 +508,8 @@ function ValueDialog({
   onClose: () => void;
 }) {
   const [value, setValue] = useState(node.value);
+  const editor = useProject((s) => s.settings?.editor);
+  const { family, size } = resolveMonoFont(undefined, editor);
   useEffect(() => {
     const s = session != null ? useDebug.getState().sessions[session] : undefined;
     if (!s || s.status !== "paused" || !node.evaluateName || node.reference > 0) return;
@@ -510,21 +530,36 @@ function ValueDialog({
       dismissOnBackdrop
       onClose={onClose}
       title={`${node.name}${node.typeName ? ` {${node.typeName}}` : ""}`}
-      width={720}
-      minHeight={260}
-      maxHeight={560}
+      width="clamp(420px, 50vw, 820px)"
+      minWidth={320}
+      minHeight={200}
       resizable="both"
       aria-label={formatMessage(tx("Value of {label}"), { label: node.name })}
+      className={styles.valuePopup}
     >
-      <div className={styles.valuePopupContent}>
-        <pre className={styles.valuePopupValue}>{text}</pre>
-      </div>
+      <pre
+        className={styles.valuePopupValue}
+        role="region"
+        aria-label={tx("Value")}
+        tabIndex={0}
+        data-autofocus=""
+        style={{
+          fontFamily: family,
+          fontSize: size,
+          fontWeight: fontWeightOf(editor?.fontWeight, 400),
+          lineHeight: editor?.lineHeight ? `${editor.lineHeight}px` : undefined,
+          tabSize: editor?.tabSize || 4,
+        }}
+      >
+        {text}
+      </pre>
     </Dialog>
   );
 }
 
 function VarEditRow({
   node,
+  changed,
   value,
   error,
   onChange,
@@ -532,6 +567,7 @@ function VarEditRow({
   onCancel,
 }: {
   node: VarNode;
+  changed: boolean;
   value: string;
   error: string | null;
   onChange: (v: string) => void;
@@ -542,37 +578,36 @@ function VarEditRow({
   // the global "Escape → focus editor" binding (`!popupOpen`) from firing.
   useEffect(() => acquirePopup(), []);
   return (
-    <span className={styles.row}>
-      <span className={styles.name} title={node.name}>
-        {node.name}
+    <span className={clsx(styles.row, styles.editRow)} title={node.name}>
+      <VarPrefix node={node} changed={changed} />
+      <span className={styles.valueGroup}>
+        <input
+          className={clsx(styles.editInput, error && styles.editInvalid)}
+          value={value}
+          autoFocus
+          spellCheck={false}
+          autoComplete="off"
+          aria-label={`New value of ${node.name}`}
+          aria-invalid={!!error || undefined}
+          title={error ?? undefined}
+          onFocus={(e) => e.currentTarget.select()}
+          onChange={(e) => onChange(e.target.value)}
+          onClick={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          onBlur={onCancel}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onCommit();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              onCancel();
+            }
+          }}
+        />
+        {error && <span className={clsx(styles.error, styles.editError)}>{oneLine(error)}</span>}
       </span>
-      <span className={styles.eq}>=</span>
-      <input
-        className={clsx(styles.editInput, error && styles.editInvalid)}
-        value={value}
-        autoFocus
-        spellCheck={false}
-        autoComplete="off"
-        aria-label={`New value of ${node.name}`}
-        aria-invalid={!!error || undefined}
-        title={error ?? undefined}
-        onFocus={(e) => e.currentTarget.select()}
-        onChange={(e) => onChange(e.target.value)}
-        onClick={(e) => e.stopPropagation()}
-        onDoubleClick={(e) => e.stopPropagation()}
-        onBlur={onCancel}
-        onKeyDown={(e) => {
-          e.stopPropagation();
-          if (e.key === "Enter") {
-            e.preventDefault();
-            onCommit();
-          } else if (e.key === "Escape") {
-            e.preventDefault();
-            onCancel();
-          }
-        }}
-      />
-      {error && <span className={styles.error}>{error}</span>}
     </span>
   );
 }
@@ -581,6 +616,31 @@ function nodeIcon(node: VarNode): string {
   if (node.kind === "watch") return "eye";
   if (node.kind === "eval") return "evaluate-expression";
   return node.depth0 ? "variable" : "field";
+}
+
+function VarPrefix({ node, changed, showName = true }: { node: VarNode; changed: boolean; showName?: boolean }) {
+  const evaluation = node.kind === "eval";
+  return (
+    <>
+      <Icon name={nodeIcon(node)} size={16} className={styles.nodeIcon} />
+      {showName && (
+        <>
+          <span
+            className={clsx(
+              styles.name,
+              evaluation && styles.evalName,
+              node.kind === "var" && styles.varName,
+              changed && styles.changed,
+            )}
+            title={evaluation ? node.name : undefined}
+          >
+            {evaluation ? oneLine(node.name) : node.name}
+          </span>
+          <span className={styles.eq}>=</span>
+        </>
+      )}
+    </>
+  );
 }
 
 function VarRow({
@@ -622,26 +682,9 @@ function VarRow({
     );
   const kind = node.error ? null : classifyValue(node.value, node.typeName);
   const shown = shownValue(node.value, node.typeName);
-  const evaluation = node.kind === "eval";
   return (
     <span className={styles.row} title={node.name}>
-      <Icon name={nodeIcon(node)} size={16} className={styles.nodeIcon} />
-      {!shown.entry && (
-        <>
-          <span
-            className={clsx(
-              styles.name,
-              evaluation && styles.evalName,
-              node.kind === "var" && styles.varName,
-              changed && styles.changed,
-            )}
-            title={evaluation ? node.name : undefined}
-          >
-            {evaluation ? oneLine(node.name) : node.name}
-          </span>
-          <span className={styles.eq}>=</span>
-        </>
-      )}
+      <VarPrefix node={node} changed={changed} showName={!shown.entry} />
       {node.error ? (
         <span className={styles.error}>{oneLine(node.error)}</span>
       ) : (

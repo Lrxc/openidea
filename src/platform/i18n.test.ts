@@ -13,6 +13,7 @@ import {
   SUPPORTED_LOCALES,
   t,
   tx,
+  txPart,
   txTemplate,
   useI18n,
 } from "./i18n";
@@ -81,6 +82,12 @@ describe("t / locales", () => {
   it("resolves locale tags", () => {
     expect(resolveLocale("zh-CN")).toBe("zh");
     expect(resolveLocale("zh_Hans")).toBe("zh");
+    expect(resolveLocale("zh-Hans-HK")).toBe("zh");
+    expect(resolveLocale("zh-TW")).toBe("zh-TW");
+    expect(resolveLocale("zh_tw")).toBe("zh-TW");
+    expect(resolveLocale("zh-HK")).toBe("zh-TW");
+    expect(resolveLocale("zh-Hant")).toBe("zh-TW");
+    expect(resolveLocale("zh-Hant-TW")).toBe("zh-TW");
     expect(resolveLocale("ko-KR")).toBe("ko");
     expect(resolveLocale("pt-BR")).toBe("pt");
     expect(resolveLocale("pt_PT")).toBe("pt");
@@ -112,6 +119,8 @@ describe("t / locales", () => {
     );
     await setLocale("zh-CN");
     expect(t("app.keymap.count", { count: 1 })).toBe("1 个快捷键");
+    await setLocale("zh-Hant-TW");
+    expect(t("app.keymap.count", { count: 1 })).toBe("1 個快速鍵");
     await setLocale("pt-BR");
     expect(t("app.keymap.count", { count: 1 })).toBe("1 atalho");
     expect(t("app.keymap.count", { count: 5 })).toBe("5 atalhos");
@@ -187,12 +196,17 @@ describe("t / locales", () => {
     expect(txTemplate(built)).toBe("运行 'orders'");
     const zh = tx`Run '${name}'`;
     expect(zh).toBe("运行 'orders'");
-    // Substituted text is translated when the catalog has it.
-    expect(tx`Run '${"Retry"}'`).toBe(`运行 '${tx("Retry")}'`);
+    // Values are inserted as written, even when the catalog has an entry for them…
+    expect(tx`Rename directory '${"tasks"}' and its usages to:`).toBe("将目录“tasks”及其用法重命名为：");
+    expect(tx`Run '${"Retry"}'`).toBe("运行 'Retry'");
+    // …unless they are marked as UI text, which is translated again after a locale change.
+    const marked = tx`Run '${txPart("Retry")}'`;
+    expect(marked).toBe(`运行 '${tx("Retry")}'`);
     // Values are inserted as they are, braces included.
     expect(tx`Drop ${"stash@{0}"}? This cannot be undone.`).toBe("是否丢弃 stash@{0}？此操作无法撤消。");
     await setLocale("en");
     expect(tx(zh)).toBe("Run 'orders'");
+    expect(tx(marked)).toBe("Run 'Retry'");
   });
 
   it("loads the Portuguese catalogs", async () => {
@@ -271,6 +285,7 @@ describe("catalogs", () => {
     "16384 MB",
     "Docker",
     "URL",
+    "ID:",
     "Code Vision",
     "JUnit",
     "⌘Enter",
@@ -289,6 +304,10 @@ describe("catalogs", () => {
     "Claude Code",
     "GitHub Copilot",
     "Codex",
+    "SKILL.md",
+    "context: fork",
+    "paths ({count})",
+    "paths",
     "Cursor",
     "PHP",
     "SQL",
@@ -326,6 +345,12 @@ describe("catalogs", () => {
     expect(translated.length).toBeGreaterThan(0);
     expect(Object.keys(translations).sort()).toEqual(translated);
     expect(Object.keys(texts).sort()).toEqual([...SUPPORTED_LOCALES].sort());
+  });
+
+  it("are the locales the backend picks from the OS language on first launch", () => {
+    const rust = readFileSync(join(LOCALES_DIR, "../../../crates/ide-workspace/src/settings.rs"), "utf8");
+    const list = /pub const UI_LOCALES: &\[&str\] = &\[([^\]]*)\]/.exec(rust)?.[1] ?? "";
+    expect([...list.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort()).toEqual([...SUPPORTED_LOCALES].sort());
   });
 
   it("list every key once", () => {

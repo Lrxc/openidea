@@ -858,9 +858,11 @@ function ResultRow({
             <HighlightedText className={styles.name} text={row.display} indices={row.indices} tone={tone} />
             {row.container && <span className={styles.location}>{row.container}</span>}
           </span>
-          <span className={styles.right}>
-            {row.section === "classes" ? relDir(row.rel) || basename(row.rel) : basename(row.rel)}
-          </span>
+          {row.section === "classes" ? (
+            <ResultPath path={relDir(row.rel) || basename(row.rel)} className={styles.right} />
+          ) : (
+            <span className={styles.right}>{basename(row.rel)}</span>
+          )}
         </>
       );
     case "action": {
@@ -870,11 +872,16 @@ function ResultRow({
         <span
           className={clsx(styles.actionRow, !row.enabled && styles.disabled)}
           aria-disabled={!row.enabled || undefined}
+          title={row.title}
         >
           <span className={styles.icon}>{row.icon ? <Icon name={row.icon} size={16} /> : null}</span>
           <span className={styles.main}>
             <HighlightedText className={styles.name} text={row.title} indices={row.indices} tone={tone} />
-            {shortcut && <span className={styles.shortcut}>{shortcut}</span>}
+            {shortcut && (
+              <kbd className={styles.shortcut} title={shortcut}>
+                {shortcut}
+              </kbd>
+            )}
           </span>
           {toggled !== undefined ? (
             <span
@@ -894,7 +901,11 @@ function ResultRow({
               />
             </span>
           ) : (
-            row.category && <span className={styles.right}>{row.category}</span>
+            row.category && (
+              <span className={styles.right} title={row.category}>
+                {row.category}
+              </span>
+            )
           )}
         </span>
       );
@@ -974,6 +985,16 @@ function CodeText({ path, text, indices }: { path: string; text: string; indices
   );
 }
 
+function ResultPath({ path, className }: { path: string; className?: string }) {
+  const separator = Math.max(0, path.lastIndexOf("/"));
+  return (
+    <span className={clsx(className, styles.path)} title={path}>
+      {separator > 0 && <span className={clsx(styles.pathPart, styles.pathPrefix)}>{path.slice(0, separator)}</span>}
+      <span className={styles.pathPart}>{path.slice(separator)}</span>
+    </span>
+  );
+}
+
 function FileRow({
   path,
   name,
@@ -995,11 +1016,11 @@ function FileRow({
     <>
       <Icon name={folder ? "folder" : icon} size={16} className={styles.icon} />
       <span className={styles.main}>
-        <span className={styles.name} style={deco.color ? { color: deco.color } : undefined}>
+        <span className={clsx(styles.name, styles.fileName)} style={deco.color ? { color: deco.color } : undefined}>
           <HighlightedText text={name} indices={indices} tone="strong" />
           {line !== null && <span className={styles.lineSuffix}>:{line + 1}</span>}
         </span>
-        {dir && <span className={styles.location}>{dir}</span>}
+        {dir && <ResultPath path={dir} className={styles.location} />}
       </span>
     </>
   );

@@ -133,16 +133,30 @@ test("Evaluate keeps a multiline expression and its result visible in a short di
     ];
     const stateModule = "/src/features/debugger/state.ts";
     const { adoptSession } = await import(/* @vite-ignore */ stateModule);
+    const projectModule = "/src/platform/project.ts";
+    const { useProject } = await import(/* @vite-ignore */ projectModule);
+    const settings = useProject.getState().settings;
+    useProject.setState({
+      settings: {
+        ...settings,
+        editor: { ...settings?.editor, fontFamily: "Consolas", fontSize: 18, lineHeight: 28 },
+      },
+    });
     adoptSession(session, { name: "Checkout", adapter: "debugpy", status: "paused", selectedFrame: 11 });
   }, SESSION);
 
   await page.keyboard.press("Alt+F8");
   const dialog = page.getByRole("dialog", { name: "Evaluate expression" });
   const field = dialog.getByRole("textbox", { name: "Expression" });
+  await expect(field).toHaveCSS("font-size", "18px");
+  await expect(field).toHaveCSS("line-height", "28px");
+  await expect(field).toHaveCSS("font-family", /^"?Consolas"?,/);
   const expression = ["orderSummary(", ...Array.from({ length: 12 }, (_, i) => `    item${i},`), ")"].join("\n");
   await field.fill(expression);
   await field.press("Enter");
-  const result = dialog.getByRole("tree", { name: "Evaluation result" });
+  const result = dialog.getByRole("region", { name: "Result", exact: true }).getByRole("tree", {
+    name: "Evaluation result",
+  });
   const row = result.getByRole("treeitem").first();
   await expect(row).toContainText("total = 36");
   await expect
@@ -165,8 +179,107 @@ test("Evaluate keeps a multiline expression and its result visible in a short di
   await expect(result.getByText("tax", { exact: true })).toBeVisible();
 
   await field.fill("otherExpression");
-  await dialog.getByRole("button", { name: "History", exact: true }).click();
-  await page.getByRole("menuitem", { name: /orderSummary/ }).click();
+  const historyButton = dialog.getByRole("button", { name: "History", exact: true });
+  const history = page.getByRole("menu", { name: "Expression history" });
+  const option = history.getByRole("menuitem", { name: /orderSummary/ });
+  await historyButton.click();
+  await expect(option).toBeVisible();
+  await expect(option).toHaveCSS("font-size", "18px");
+  await expect
+    .poll(async () => {
+      const inputBounds = (await field.locator("..").boundingBox())!;
+      const menuBounds = (await history.locator("..").boundingBox())!;
+      return Math.max(Math.abs(inputBounds.x - menuBounds.x), Math.abs(inputBounds.width - menuBounds.width));
+    })
+    .toBeLessThan(1);
+  await page.keyboard.press("Escape");
+  await expect(history).toBeHidden();
+  await expect(historyButton).toBeFocused();
+  await historyButton.press("Enter");
+  await option.press("Enter");
   await expect(field).toHaveValue(expression);
   await expect(field).toBeFocused();
+});
+
+test("Variables keeps evaluation, watches and expression history together in a narrow dock", async ({
+  workbench: page,
+}) => {
+  await page.setViewportSize({ width: 720, height: 620 });
+  await stubDesktop(page);
+  await page.evaluate(async (session) => {
+    const handlers = window.__ipc.handlers;
+    handlers.debug_capabilities = () => ({});
+    handlers.debug_completions = () => [];
+    handlers.debug_scopes = () => [];
+    handlers.debug_evaluate_in = () => ({
+      name: "result",
+      value: "42",
+      typeName: "int",
+      variablesReference: 0,
+      evaluateName: null,
+    });
+    const statePath = "/src/features/debugger/state.ts";
+    const historyPath = "/src/features/debugger/ui/expressionHistory.ts";
+    const projectPath = "/src/platform/project.ts";
+    const servicesPath = "/src/workbench/contributions.ts";
+    const layoutPath = "/src/workbench/toolwindows/store.ts";
+    const { adoptSession } = await import(/* @vite-ignore */ statePath);
+    const { pushHistory } = await import(/* @vite-ignore */ historyPath);
+    const { useProject } = await import(/* @vite-ignore */ projectPath);
+    const { toolWindowService } = await import(/* @vite-ignore */ servicesPath);
+    const { moveToolWindow, setToolWindowSize } = await import(/* @vite-ignore */ layoutPath);
+    const settings = useProject.getState().settings;
+    useProject.setState({
+      settings: { ...settings, editor: { ...settings?.editor, fontFamily: "Consolas", fontSize: 18 } },
+    });
+    pushHistory("evaluate", "order.total + tax");
+    pushHistory("evaluate", "if ready:\n    settle()");
+    adoptSession(session, { name: "Checkout", adapter: "debugpy", status: "paused", selectedFrame: 11 });
+    moveToolWindow("debug", "right");
+    setToolWindowSize("right", 285);
+    toolWindowService().show("debug", true);
+  }, SESSION);
+
+  const debug = page.getByRole("region", { name: "Debug", exact: true });
+  const variables = debug.getByRole("tab", { name: "Variables", exact: true });
+  if (await variables.isVisible()) await variables.click();
+  const field = debug.getByRole("textbox", { name: "Evaluate expression", exact: true });
+  const historyButton = debug.getByRole("button", { name: "History", exact: true });
+  const watch = debug.getByRole("button", { name: "Add to Watches", exact: true });
+  await expect(field).toBeVisible();
+  await expect(historyButton).toBeVisible();
+  await expect(field).toHaveAttribute("placeholder", "Evaluate expression");
+  await expect(field).toHaveCSS("font-family", /^"?Consolas"?,/);
+  await expect(field).toHaveCSS("font-size", "13px");
+  expect((await field.boundingBox())!.width).toBeGreaterThan(100);
+  expect((await watch.boundingBox())!.x).toBeLessThan((await historyButton.boundingBox())!.x);
+
+  await historyButton.click();
+  const menu = page.getByRole("menu", { name: "Expression history", exact: true });
+  await expect(menu.getByRole("menuitem")).toHaveText(["order.total + tax"]);
+  const row = (await field.locator("..").boundingBox())!;
+  const popup = (await menu.locator("..").boundingBox())!;
+  expect(popup.x).toBeCloseTo(row.x, 0);
+  expect(popup.width).toBeCloseTo(row.width, 0);
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  await expect(historyButton).toBeFocused();
+
+  await historyButton.press("Enter");
+  await menu.getByRole("menuitem", { name: "order.total + tax" }).press("Enter");
+  await expect(field).toBeFocused();
+  await expect(field).toHaveValue("order.total + tax");
+  await field.press("Enter");
+  await expect
+    .poll(() => ipcCalls(page, "debug_evaluate_in"))
+    .toContainEqual(expect.objectContaining({ expression: "order.total + tax", context: "repl" }));
+
+  await field.fill("order.total");
+  await watch.click();
+  await expect(field).toHaveValue("");
+  await expect
+    .poll(() => ipcCalls(page, "debug_evaluate_in"))
+    .toContainEqual(expect.objectContaining({ expression: "order.total", context: "watch" }));
+  await historyButton.click();
+  await expect(menu.getByRole("menuitem")).toHaveText(["order.total", "order.total + tax"]);
 });

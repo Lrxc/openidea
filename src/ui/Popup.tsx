@@ -56,6 +56,7 @@ export interface PopupProps {
   style?: CSSProperties;
   role?: string;
   "aria-label"?: string;
+  "aria-describedby"?: string;
   /** Keep Tab inside the popup. */
   trapFocus?: boolean;
   /** Focus on open: `true` = first `[data-autofocus]`/focusable/the popup itself; `false` = leave focus. */
@@ -94,6 +95,29 @@ const measureNaturalHeight: Middleware = {
     return { data: { measured: true }, reset: previousLimit ? { rects: true } : undefined };
   },
 };
+
+function watchResizablePopup(reference: Element | VirtualElement, floating: HTMLElement, update: () => void) {
+  // Positioning writes the popup's size limits. Defer those writes outside the resize observer's delivery.
+  let frame = 0;
+  let placed = false;
+  const stop = autoUpdate(reference, floating, () => {
+    // The first placement runs at once, so the popup opens where it stays.
+    if (!placed) {
+      placed = true;
+      update();
+      return;
+    }
+    if (frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      update();
+    });
+  });
+  return () => {
+    stop();
+    cancelAnimationFrame(frame);
+  };
+}
 
 function toReference(anchor: PopupAnchor): Element | VirtualElement | null {
   if (!anchor || anchor === "center") return null;
@@ -164,7 +188,7 @@ function PopupInner({
     transform: false,
     middleware,
     elements: { reference },
-    whileElementsMounted: autoUpdate,
+    whileElementsMounted: resizable ? watchResizablePopup : autoUpdate,
   });
   const elRef = useRef<HTMLDivElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -267,6 +291,7 @@ function PopupInner({
       data-popup=""
       role={role}
       aria-label={aria["aria-label"]}
+      aria-describedby={aria["aria-describedby"]}
       tabIndex={-1}
       className={clsx(styles.popup, centered && styles.centered, !unstyled && styles.surface, className)}
       data-positioned={centered || isPositioned || undefined}

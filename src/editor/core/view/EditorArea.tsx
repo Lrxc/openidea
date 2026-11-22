@@ -31,6 +31,7 @@ import {
   useTextEditorWrappers,
   type EditorInput,
   type EditorKindContribution,
+  type TextEditorWrapperContribution,
 } from "@/workbench/contributions";
 import { useDistractionFree } from "@/workbench/distractionFree";
 import { useFileColors } from "@/workbench/fileColors";
@@ -218,15 +219,23 @@ function PaneView({ paneId }: { paneId: string }) {
       const pin = t.pinned ? <Icon name="pin" size={11} className={styles.pin} label="Pinned" /> : null;
       const file = t.input.kind === "file" && t.input.path ? files.get(t.input.path) : undefined;
       const title = markModified && dirty[i] ? `*${name}` : name;
+      const prefix = t.input.kind === "file" && dupe ? (dupe.endsWith("/") ? dupe : `${dupe}/`) : null;
       return {
         id: t.id,
-        label: (
+        label: prefix ? (
+          <span className={styles.tabPath}>
+            <span className={styles.tabDirectory}>
+              <span>{prefix}</span>
+            </span>
+            <span className={clsx(styles.tabFilename, file?.deprecated && styles.deprecated)}>{title}</span>
+          </span>
+        ) : (
           <>
             {file?.deprecated ? <span className={styles.deprecated}>{title}</span> : title}
             {dupe && <span className={styles.dupe}>{dupe}</span>}
           </>
         ),
-        text: dupe ? `${name} — ${dupe}` : name,
+        text: prefix ? `${prefix}${name}` : dupe ? `${name} — ${dupe}` : name,
         icon: showFileIcon
           ? t.input.kind === "file" && t.input.path
             ? (tabIcons[i] ?? file?.icon)
@@ -355,6 +364,7 @@ function PaneView({ paneId }: { paneId: string }) {
       panelIdPrefix={`editor-${paneId}`}
       dnd={stripDnd}
       layout={tabPrefs.multipleRows ? "wrap" : tabPrefs.oneRowOverflow === "squeeze" ? "squeeze" : "scroll"}
+      hiddenTabsOnly
       closePosition={tabPrefs.closeButtonPosition === "left" ? "left" : "right"}
       onSelect={(id) => ctrl.activate(paneId, id)}
       onClose={(id) => void ctrl.closeTab(paneId, id)}
@@ -457,6 +467,26 @@ function virtualTooltip(input: EditorInput): string | null {
   return [d?.description, input.path].filter(Boolean).join("\n");
 }
 
+const sourceShown = () => false;
+
+/** Code breadcrumbs of a text editor, unless its wrapper hides the source (Markdown Preview Only). */
+function PaneBreadcrumbs({
+  wrapper,
+  path,
+  tabId,
+  position,
+}: {
+  wrapper: TextEditorWrapperContribution | undefined;
+  path: string;
+  tabId: string;
+  position: "top" | "bottom";
+}) {
+  // Keyed by the wrapper id, so the hook stays the same for the component's life.
+  const useSourceHidden = wrapper?.useSourceHidden ?? sourceShown;
+  if (useSourceHidden(tabId)) return null;
+  return <CodeBreadcrumbs path={path} tabId={tabId} position={position} />;
+}
+
 function PaneContent({ paneId, tab, tabsVisible }: { paneId: string; tab: Tab; tabsVisible: boolean }) {
   const crumbs = !useDistractionFree((s) => s.active);
   const wrappers = useTextEditorWrappers((s) => s.wrappers);
@@ -472,7 +502,9 @@ function PaneContent({ paneId, tab, tabsVisible }: { paneId: string; tab: Tab; t
           <EditorBanners path={tab.input.path} />
         )}
         <FindBar paneId={paneId} />
-        {crumbs && <CodeBreadcrumbs path={tab.input.path!} tabId={tab.id} position="top" />}
+        {crumbs && (
+          <PaneBreadcrumbs key={wrapper?.id} wrapper={wrapper} path={tab.input.path!} tabId={tab.id} position="top" />
+        )}
         {wrapper ? (
           <wrapper.component
             key={tab.id}
@@ -485,7 +517,15 @@ function PaneContent({ paneId, tab, tabsVisible }: { paneId: string; tab: Tab; t
         ) : (
           host
         )}
-        {crumbs && <CodeBreadcrumbs path={tab.input.path!} tabId={tab.id} position="bottom" />}
+        {crumbs && (
+          <PaneBreadcrumbs
+            key={wrapper?.id}
+            wrapper={wrapper}
+            path={tab.input.path!}
+            tabId={tab.id}
+            position="bottom"
+          />
+        )}
       </>
     );
   }
